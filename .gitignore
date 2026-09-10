@@ -1,0 +1,49 @@
+# Environment — NEVER commit this
+.env
+*.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+dist/
+build/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+venv/
+env/
+.venv/
+.tox/
+
+# Session files — contain private keys
+*.session
+*.session-journal
+
+# Temporary files
+/tmp/
+*.tmp
+*.log
+melody.log
+
+# Pillow / image cache
+*.png.tmp
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/

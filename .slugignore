@@ -1,0 +1,13 @@
+# Runtime slug contains only deployable bot code and assets.
+.git/
+.github/
+tests/
+docs/
+*.md
+*.log
+*.session
+*.session-journal
+__pycache__/
+*.py[cod]
+.env
+*.env

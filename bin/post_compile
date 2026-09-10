@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# Heroku Python buildpack runs this after pip install.
+#
+# Real root cause of "Sign in to confirm you're not a bot" / "Requested
+# format is not available" on Heroku: YouTube now requires a Proof-of-Origin
+# (PO) token for essentially every client, and Heroku's dyno IPs sit in
+# well-known cloud/datacenter ranges that get flagged hardest. Cookies alone
+# do not fix this. A paid proxy can mask the IP, but the actual fix yt-dlp
+# recommends is generating a valid PO token — that's what bgutil provides,
+# for free, self-hosted inside the dyno.
+#
+# This installs:
+#   1. Deno — the JS runtime yt-dlp's YouTube extractor needs to solve the
+#      player challenge and to run bgutil's token-generator script.
+#   2. bgutil-ytdlp-pot-provider — a yt-dlp plugin + Deno-based local script
+#      that generates PO tokens on demand. Loaded via sys.path in
+#      melody/core/ytdl.py.
+
+set -e
+
+BUILD_DIR=${1:-${BUILD_DIR:-$(pwd)}}
+
+# ── Deno ─────────────────────────────────────────────────────────────────
+# Persist Deno's module/npm cache inside the slug. Without this the worker
+# re-downloaded the whole bgutil npm dependency tree on first use and spammed
+# hundreds of "Download https://registry.npmjs.org/..." lines into the logs.
+export DENO_DIR="$BUILD_DIR/vendor/deno_cache"
+export DENO_NO_UPDATE_CHECK=1
+mkdir -p "$DENO_DIR"
+
+DENO_BIN_DIR="$BUILD_DIR/vendor/deno/bin"
+DENO_TMP="$BUILD_DIR/vendor/deno_tmp"
+mkdir -p "$DENO_BIN_DIR" "$DENO_TMP"
+
+DENO_VERSION="$(curl -fsSL --retry 3 --retry-all-errors https://dl.deno.land/release-latest.txt 2>/dev/null | tr -d '\r\n')"
+[ -n "$DENO_VERSION" ] || DENO_VERSION="v2.9.5"
+
+if command -v deno >/dev/null 2>&1; then
+  echo "-----> Deno already available: $(command -v deno)"
+else
+  echo "-----> Installing Deno $DENO_VERSION for yt-dlp YouTube challenge solving"
+  # ROOT-CAUSE FIX ("Connection died, tried 5 times before giving up /
+  # Deno download failed" -> no JS runtime -> every video fails with
+  # "Requested format is not available" -> bot skips every song):
+  # GitHub's release download endpoint intermittently answers 503 / drops the
+  # connection. dl.deno.land is Deno's own CDN and is tried FIRST, with the
+  # GitHub URLs as fallbacks, and every attempt retries on any error.
+  DENO_OK=0
+  for DENO_URL in \
+    "https://dl.deno.land/release/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+    "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip" \
+    "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
+  do
+    echo "       trying $DENO_URL"
+    if curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 300 \
+         "$DENO_URL" -o "$DENO_TMP/deno.zip" \
+      && python -c 'import sys,zipfile;zipfile.ZipFile(sys.argv[1]).extract("deno", sys.argv[2])' \
+           "$DENO_TMP/deno.zip" "$DENO_BIN_DIR"
+    then
+      chmod +x "$DENO_BIN_DIR/deno"
+      echo "       Deno installed at $DENO_BIN_DIR/deno OK"
+      DENO_OK=1
+      break
+    fi
+    rm -f "$DENO_TMP/deno.zip"
+  done
+  if [ "$DENO_OK" != "1" ]; then
+    echo "       WARN Deno download failed on all mirrors; the bot retries at startup (ensure_deno_runtime)"
+  fi
+fi
+rm -rf "$DENO_TMP"
+
+if [ -x "$DENO_BIN_DIR/deno" ]; then
+  "$DENO_BIN_DIR/deno" --version | head -3
+elif command -v deno >/dev/null 2>&1; then
+  deno --version | head -3
+fi
+
+# ── bgutil PO-token provider ────────────────────────────────────────────
+BGUTIL_VERSION="1.3.1"
+BGUTIL_HOME="$BUILD_DIR/vendor/bgutil-ytdlp-pot-provider"
+BGUTIL_TMP="$BUILD_DIR/vendor/bgutil_tmp"
+BGUTIL_ZIP="$BGUTIL_TMP/bgutil.zip"
+# The tagged source archive (not the release asset) also contains
+# server/src/generate_once.ts plus the locked Deno/npm dependency manifests.
+BGUTIL_URL="https://github.com/Brainicism/bgutil-ytdlp-pot-provider/archive/refs/tags/${BGUTIL_VERSION}.zip"
+
+rm -rf "$BGUTIL_HOME" "$BGUTIL_TMP"
+mkdir -p "$BGUTIL_HOME" "$BGUTIL_TMP"
+echo "-----> Installing bgutil yt-dlp PO-token provider v${BGUTIL_VERSION}"
+
+if { curl -fsSL --retry 6 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 300 "$BGUTIL_URL" -o "$BGUTIL_ZIP" \
+     || curl -fsSL --retry 6 --retry-delay 3 --retry-all-errors "https://codeload.github.com/Brainicism/bgutil-ytdlp-pot-provider/zip/refs/tags/${BGUTIL_VERSION}" -o "$BGUTIL_ZIP"; } \
+  && python - "$BGUTIL_ZIP" "$BGUTIL_TMP/extracted" <<'PY'
+import sys
+import zipfile
+
+archive_path, output_dir = sys.argv[1:3]
+with zipfile.ZipFile(archive_path) as archive:
+    archive.extractall(output_dir)
+PY
+then
+  BGUTIL_ROOT=$(find "$BGUTIL_TMP/extracted" -mindepth 1 -maxdepth 1 -type d -print -quit)
+  if [ -d "$BGUTIL_ROOT/plugin" ] && [ -f "$BGUTIL_ROOT/server/src/generate_once.ts" ]; then
+    cp -R "$BGUTIL_ROOT/plugin" "$BGUTIL_HOME/plugin"
+    cp -R "$BGUTIL_ROOT/server" "$BGUTIL_HOME/server"
+  else
+    echo "       ⚠️ bgutil archive layout is unexpected; provider will remain inactive"
+    rm -rf "$BGUTIL_HOME"
+  fi
+
+  if [ -x "$DENO_BIN_DIR/deno" ]; then
+    BGUTIL_DENO="$DENO_BIN_DIR/deno"
+  else
+    BGUTIL_DENO="$(command -v deno || true)"
+  fi
+  if [ -n "$BGUTIL_DENO" ] && [ -f "$BGUTIL_HOME/server/src/generate_once.ts" ]; then
+    if (
+      cd "$BGUTIL_HOME/server"
+      "$BGUTIL_DENO" install --allow-scripts=npm:canvas --frozen
+    ); then
+      mkdir -p "$BGUTIL_HOME/cache"
+      XDG_CACHE_HOME="$BGUTIL_HOME/cache" \
+        "$BGUTIL_DENO" run \
+          --allow-env \
+          --allow-net \
+          "--allow-ffi=$BGUTIL_HOME/server/node_modules" \
+          "--allow-write=$BGUTIL_HOME/cache" \
+          "--allow-read=$BGUTIL_HOME/cache,$BGUTIL_HOME/server/node_modules" \
+          "$BGUTIL_HOME/server/src/generate_once.ts" --version
+      echo "       bgutil plugin + Deno provider installed ✅"
+    else
+      echo "       ⚠️ bgutil Deno dependency install failed; built-in yt-dlp providers remain available"
+    fi
+  else
+    echo "       ⚠️ Deno unavailable; bgutil plugin will remain inactive"
+  fi
+else
+  echo "       ⚠️ bgutil download failed; yt-dlp will use its built-in providers"
+fi
+
+rm -rf "$BGUTIL_TMP"
+
+# ── Static ffmpeg/ffprobe ────────────────────────────────────────────────
+# ROOT-CAUSE FIX for "ffmpeg: error while loading shared libraries:
+# libpulsecommon-17.0.so" — the apt-installed ffmpeg cannot resolve
+# pulseaudio's private libs, so every stream ended 0 ms after starting and the
+# bot appeared alive (still reacting to messages) while playing nothing.
+# A static build has zero shared-library dependencies. .profile.d/zz-ffmpeg.sh
+# puts it first on PATH at dyno boot; utils/ffmpeg_runtime.py verifies at
+# startup and self-heals if this step could not run.
+FFMPEG_DIR="$BUILD_DIR/vendor/ffmpeg/bin"
+if [ -x "$FFMPEG_DIR/ffmpeg" ] && [ -x "$FFMPEG_DIR/ffprobe" ]; then
+  echo "-----> Static ffmpeg already vendored"
+else
+  mkdir -p "$FFMPEG_DIR"
+  echo "-----> Installing static ffmpeg/ffprobe"
+  FF_OK=0
+  for FF_URL in \
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+  do
+    echo "       trying $FF_URL"
+    if curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --connect-timeout 20 --max-time 420 \
+         "$FF_URL" -o "$BUILD_DIR/vendor/ffmpeg.tar.xz" \
+      && python - "$BUILD_DIR/vendor/ffmpeg.tar.xz" "$FFMPEG_DIR" <<'PY'
+import os
+import shutil
+import sys
+import tarfile
+
+archive, out_dir = sys.argv[1:3]
+wanted = {"ffmpeg", "ffprobe"}
+found = set()
+# Python's lzma-backed tarfile avoids depending on an `xz` CLI in the builder.
+with tarfile.open(archive, "r:xz") as tar:
+    for member in tar.getmembers():
+        name = os.path.basename(member.name)
+        if name not in wanted or not member.isfile():
+            continue
+        src = tar.extractfile(member)
+        if src is None:
+            continue
+        dest = os.path.join(out_dir, name)
+        with open(dest, "wb") as handle:
+            shutil.copyfileobj(src, handle)
+        os.chmod(dest, 0o755)
+        found.add(name)
+sys.exit(0 if found == wanted else 1)
+PY
+    then
+      FF_OK=1
+      break
+    fi
+    rm -f "$BUILD_DIR/vendor/ffmpeg.tar.xz"
+  done
+  rm -f "$BUILD_DIR/vendor/ffmpeg.tar.xz"
+  if [ "$FF_OK" = "1" ]; then
+    "$FFMPEG_DIR/ffmpeg" -version | head -1
+    "$FFMPEG_DIR/ffprobe" -version | head -1
+    echo "       static ffmpeg installed ✅"
+  else
+    echo "       ⚠️ static ffmpeg download failed; falling back to the apt build (LD_LIBRARY_PATH repaired at boot)"
+  fi
+fi

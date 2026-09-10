@@ -1,0 +1,110 @@
+{
+  "name": "Melody Music Bot",
+  "description": "🎶 Premium Telegram Music Bot — YouTube streaming, AutoPlay, Lyrics, Colored Controls",
+  "keywords": [
+    "telegram",
+    "music",
+    "bot",
+    "youtube",
+    "pyrogram"
+  ],
+  "logo": "https://i.imgur.com/xvFgXuG.png",
+  "success_url": "/",
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API Hash from my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "Bot token from @BotFather",
+      "required": true
+    },
+    "MONGO_DB_URI": {
+      "description": "NEW/live MongoDB Atlas URI for this Melody bot (mongodb+srv://...)",
+      "required": true
+    },
+    "STRING_SESSION": {
+      "description": "Pyrogram string session of assistant/userbot account",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram numeric user ID",
+      "required": true
+    },
+    "OWNER_NAME": {
+      "description": "Alias shown in play cards (e.g. Maestro) — NOT your real name",
+      "value": "Maestro",
+      "required": false
+    },
+    "LOG_GROUP_ID": {
+      "description": "Private Telegram group ID for error logs (e.g. -1001234567890). Must be a group where YOUR bot is an admin -- do not reuse an example/old ID.",
+      "required": true
+    },
+    "BOT_USERNAME": {
+      "description": "Your bot's username e.g. @YourMelodyBot",
+      "value": "@MelodiXMusic_Bot",
+      "required": false
+    },
+    "GENIUS_API_TOKEN": {
+      "description": "Genius API token from genius.com/api-clients (for lyrics)",
+      "required": false
+    },
+    "YT_COOKIES": {
+      "description": "Paste the raw contents of a cookies.txt exported from a browser logged into youtube.com (Netscape format). Base64 also accepted. Strongly recommended on Heroku to avoid bot-detection blocks.",
+      "required": false
+    },
+    "YOUTUBE_API_KEY": {
+      "description": "YouTube Data API v3 key — makes song search/metadata resolve in ~0.3s instead of several seconds. Comma-separate multiple keys to auto-rotate on quota.",
+      "required": false
+    },
+    "AUTOPLAY": {
+      "description": "Enable autoplay by default (true/false)",
+      "value": "true",
+      "required": false
+    },
+    "MUSIC_ONLY_MODE": {
+      "description": "Load only music handlers to reduce startup/RAM (true/false)",
+      "value": "false",
+      "required": false
+    },
+    "PLAYBACK_RECOVERY": {
+      "description": "Rejoin old voice chats after restart; keep false for fastest safe startup",
+      "value": "false",
+      "required": false
+    },
+    "MONGO_GRIDFS_CACHE": {
+      "description": "Optional secondary GridFS upload cache; keep false on small Heroku dynos",
+      "value": "false",
+      "required": false
+    },
+    "SOURCE_CODE_URL": {
+      "description": "Optional public repository URL for the Source Code button. Leave empty to keep this build private.",
+      "required": false,
+      "value": ""
+    },
+    "MEM_SOFT_LIMIT_MB": {
+      "description": "RSS (MB) above which the memory watchdog trims freed memory back to the OS. Leave empty to auto-derive ~80% of the dyno quota.",
+      "required": false,
+      "value": "820"
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "standard-2x"
+    }
+  },
+  "buildpacks": [
+    {
+      "url": "heroku-community/apt"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "stack": "heroku-26"
+}
