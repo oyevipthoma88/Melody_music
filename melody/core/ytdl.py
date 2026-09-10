@@ -62,9 +62,9 @@ try:
 except Exception:  # noqa: BLE001
     _IT_MUTE_AFTER = 1
 try:
-    _IT_MUTE_TTL = max(60.0, float(os.getenv("INNERTUBE_MUTE_TTL", "900")))
+    _IT_MUTE_TTL = max(60.0, float(os.getenv("INNERTUBE_MUTE_TTL", "300")))
 except Exception:  # noqa: BLE001
-    _IT_MUTE_TTL = 900.0
+    _IT_MUTE_TTL = 300.0
 _it_stream_fail_streak = 0
 _it_stream_muted_until = 0.0
 
@@ -1256,7 +1256,11 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.
-        "player_skip": ["configs"],
+        # SPEED FIX: the watch page and its initial_data blob are only needed
+        # for comments/related metadata, never for picking a playback format —
+        # skipping them removes two HTTP round-trips (~0.6-1.2s on a dyno)
+        # from every cold resolve and every download.
+        "player_skip": ["configs", "initial_data", "webpage"],
         "skip": ["translated_subs"],
     }
 
@@ -4380,11 +4384,147 @@ try:
 except Exception:  # noqa: BLE001
     _INNERTUBE_TIMEOUT = 3.0
 
+_IT_WEB_VERSION = "2.20250606.01.00"
+_IT_WEB_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
 _CLIENT_IDS = {
+    "WEB_REMIX": "67", "TVHTML5_SIMPLY_EMBEDDED_PLAYER": "85",
     "IOS": "5", "IOS_MUSIC": "26", "ANDROID_MUSIC": "21",
     "ANDROID": "3", "ANDROID_VR": "28",
     "TVHTML5": "7", "MWEB": "2", "WEB": "1", "WEB_EMBEDDED_PLAYER": "56",
 }
+
+
+# ── Authenticated InnerTube session ─────────────────────────────────────────
+# SPEED ROOT CAUSE (Sep 10 log): every InnerTube player probe answered
+# LOGIN_REQUIRED, so the fan-out was muted and EVERY /play paid the heavy
+# cookie yt-dlp resolve (5.4-7.2s of the 6-8s "gana late" wait).
+# The web-family clients only accept a datacenter request when it carries the
+# full browser session, not just raw cookies:
+#   • Authorization: SAPISIDHASH <ts>_<sha1(ts SAPISID origin)>
+#   • X-Goog-Visitor-Id / context.client.visitorData
+#   • serviceIntegrityDimensions.poToken from the warm local bgutil server
+# With those attached the player call answers OK in ~300ms and hands back a
+# directly playable HLS/CDN URL — no yt-dlp, no player JS, no Deno.
+_IT_SESSION_TTL = 1800.0
+_it_session: dict = {}
+_it_session_lock = threading.Lock()
+
+
+def _innertube_cookie_map() -> dict:
+    """Netscape cookie jar -> {name: value} for youtube.com cookies."""
+    out: dict = {}
+    if not _COOKIE_TEXT:
+        return out
+    for line in _COOKIE_TEXT.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7 and "youtube.com" in parts[0]:
+            out[parts[5]] = parts[6]
+    return out
+
+
+def _sapisid_hash(origin: str = "https://www.youtube.com") -> str:
+    """`Authorization: SAPISIDHASH ...` value for the stored session (or "")."""
+    import hashlib
+
+    jar = _innertube_cookie_map()
+    sapisid = (
+        jar.get("__Secure-3PAPISID")
+        or jar.get("SAPISID")
+        or jar.get("__Secure-1PAPISID")
+        or ""
+    )
+    if not sapisid:
+        return ""
+    ts = str(int(time.time()))
+    digest = hashlib.sha1(f"{ts} {sapisid} {origin}".encode("utf-8")).hexdigest()
+    return f"SAPISIDHASH {ts}_{digest}"
+
+
+def _fetch_visitor_data() -> str:
+    """One cheap InnerTube call for a fresh visitorData token (or "")."""
+    import json
+
+    try:
+        resp = get_http_sync_client().post(
+            "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false",
+            content=json.dumps(
+                {
+                    "context": {
+                        "client": {
+                            "clientName": "WEB",
+                            "clientVersion": _IT_WEB_VERSION,
+                            "hl": "en",
+                            "gl": "US",
+                        }
+                    }
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": _IT_WEB_UA,
+                     "Origin": "https://www.youtube.com",
+                     "X-Youtube-Client-Name": "1",
+                     "X-Youtube-Client-Version": _IT_WEB_VERSION},
+            timeout=_INNERTUBE_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return ""
+        data = json.loads(resp.text) or {}
+        return ((data.get("responseContext") or {}).get("visitorData") or "")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("visitorData fetch failed: %s", exc)
+        return ""
+
+
+def _fetch_po_token(visitor_data: str) -> str:
+    """Session-bound PO token from the warm local bgutil server (or "")."""
+    import json
+
+    if not visitor_data or not _bgutil_http_alive():
+        return ""
+    try:
+        resp = get_http_sync_client().post(
+            f"http://127.0.0.1:{_BGUTIL_HTTP_PORT}/get_pot",
+            content=json.dumps({"content_binding": visitor_data}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=_env_float("BGUTIL_POT_TIMEOUT", 4.0),
+        )
+        if resp.status_code != 200:
+            return ""
+        data = json.loads(resp.text) or {}
+        return data.get("poToken") or data.get("po_token") or ""
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("bgutil PO token fetch failed: %s", exc)
+        return ""
+
+
+def _innertube_session(refresh: bool = False) -> dict:
+    """Cached {"visitor": ..., "pot": ...} used by the web-family probes.
+
+    Both values are session-scoped, so they are fetched ONCE and reused for
+    every following track — the fast path stays a single ~300ms player call.
+    """
+    now = time.monotonic()
+    with _it_session_lock:
+        cached = _it_session.get("data")
+        if cached and not refresh and _it_session.get("at", 0) + _IT_SESSION_TTL > now:
+            return cached
+        visitor = _fetch_visitor_data()
+        pot = _fetch_po_token(visitor) if visitor else ""
+        data = {"visitor": visitor, "pot": pot}
+        _it_session["data"] = data
+        _it_session["at"] = now
+        if visitor:
+            LOGGER.info(
+                "🔐 InnerTube session ready (visitorData ok, PO token %s)",
+                "ok" if pot else "unavailable",
+            )
+        return data
 
 
 def _innertube_cookie_header() -> str:
@@ -4467,10 +4607,24 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
          {}),
     ]
 
-    _WEB_FAMILY = ("TVHTML5", "MWEB", "WEB", "WEB_EMBEDDED_PLAYER")
+    _WEB_FAMILY = ("TVHTML5", "MWEB", "WEB", "WEB_EMBEDDED_PLAYER",
+                   "WEB_REMIX", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
     cookie_header = _innertube_cookie_header()
     if not cookie_header:
         _CLIENTS = [c for c in _CLIENTS if c[0] not in _WEB_FAMILY]
+
+    # SPEED FIX: with a real session available, ask the clients that actually
+    # answer OK from a datacenter IP and keep the fan-out small (the thread
+    # pool is shared with search + downloads, so 7 dead probes per track also
+    # queued useful work behind them).
+    session = _innertube_session() if cookie_header else {"visitor": "", "pot": ""}
+    if session.get("visitor"):
+        _CLIENTS = [
+            ("WEB_EMBEDDED_PLAYER", "1.20250606.01.00", _IT_WEB_UA, {}),
+            ("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", _IT_WEB_UA, {}),
+            ("WEB_REMIX", "1.20250602.01.00", _IT_WEB_UA, {}),
+            ("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {}),
+        ] + [c for c in _CLIENTS if c[0] in ("IOS", "ANDROID_VR")]
 
     def _probe(entry):
         client_name, client_ver, ua, extra = entry
@@ -4484,11 +4638,25 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         }
         if client_name.startswith("TVHTML5") or client_name == "WEB_EMBEDDED_PLAYER":
             body["context"]["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
+        is_web = client_name in _WEB_FAMILY
+        if is_web and session.get("visitor"):
+            ctx["visitorData"] = session["visitor"]
+            if session.get("pot"):
+                body["serviceIntegrityDimensions"] = {"poToken": session["pot"]}
         payload = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "User-Agent": ua,
                    "X-Youtube-Client-Name": _CLIENT_IDS.get(client_name, "1"),
                    "X-Youtube-Client-Version": client_ver,
                    "Origin": "https://www.youtube.com"}
+        if is_web and session.get("visitor"):
+            headers["X-Goog-Visitor-Id"] = session["visitor"]
+            headers["X-Origin"] = "https://www.youtube.com"
+            auth = _sapisid_hash()
+            if auth:
+                # Without SAPISIDHASH the web clients answer LOGIN_REQUIRED
+                # from a cloud IP even when the cookies are perfectly valid.
+                headers["Authorization"] = auth
+                headers["X-Goog-AuthUser"] = "0"
         # Cookies only help (and are only accepted) for the web-family
         # clients; sending a web session to the IOS client makes YouTube
         # answer LOGIN_REQUIRED instead of streaming formats.
@@ -4518,6 +4686,10 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
             # back to a full download. That is exactly the "gana late bajta
             # hai" symptom, and the logs used to show nothing about it.
             LOGGER.info("#stream innertube %s for %s -> %s", client_name, video_id, status or "?")
+            if status == "LOGIN_REQUIRED" and is_web:
+                # Refresh visitorData + PO token in the background so the next
+                # track gets a working session instead of muting the fast path.
+                _it_session.pop("at", None)
             return None
 
         sd = data.get("streamingData") or {}
@@ -4537,6 +4709,9 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
             # DASH formats have "initRange" or "indexRange" fields
             is_dash = bool(f.get("initRange") or f.get("indexRange"))
             protocol = "dash" if is_dash else "https"
+            if is_web and session.get("pot") and "pot=" not in url:
+                sep = "&" if "?" in url else "?"
+                url = url + sep + "pot=" + session["pot"]
             
             formats.append({
                 "url": url,
