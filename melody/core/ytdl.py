@@ -1136,6 +1136,12 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         "bestaudio[ext=webm]/"
         "bestaudio[ext=opus]/bestaudio[ext=ogg]/"
         "bestaudio[acodec=opus]/bestaudio[abr<=128]/"
+        # Sep 10 Heroku log fix: on hosts where YouTube hides every WebM/Opus
+        # format the chain used to fall straight through to "best" — a 77MB
+        # muxed mp4 that cannot be handed off early (moov at EOF). Audio-only
+        # m4a (itag 140/139) is fragmented MP4 with headers FIRST, is ~5% of
+        # the bytes, and is moov-verified before early handoff below.
+        "bestaudio[ext=m4a]/bestaudio[format_id=140]/bestaudio[format_id=139]/"
         "bestaudio[protocol=m3u8]/bestaudio[protocol=m3u8_native]/best"
 
         if audio_only
@@ -2444,11 +2450,47 @@ _EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", True)
 # can be consumed safely while yt-dlp keeps appending ordered clusters. Enable
 # this path on cloud hosts by default; video/MP4/M4A remain completion-only.
 _EARLY_AUDIO_HANDOFF_ENABLED = _env_flag("EARLY_AUDIO_HANDOFF", True)
-_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav", "mka"}
+_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav", "mka", "m4a"}
+# Extensions that are only early-handoff-safe when the moov atom sits at the
+# HEAD of the file (fragmented MP4). YouTube's audio-only m4a (itag 139/140/141)
+# is always fMP4 with the init segment first, so its prefix is playable; a
+# progressive mp4 keeps moov at EOF and stays excluded (mp4 is not in the set).
+_EARLY_AUDIO_MOOV_CHECK_EXTS = {"m4a"}
 
 
 def _early_handoff_allowed(audio_only: bool) -> bool:
     return bool(_EARLY_HANDOFF_ENABLED or (audio_only and _EARLY_AUDIO_HANDOFF_ENABLED))
+
+
+def _m4a_moov_at_head(path: str) -> bool:
+    """True when an m4a prefix already contains the moov atom (fragmented MP4).
+
+    YouTube's audio-only m4a is fMP4: the init segment (ftyp+moov) is written
+    first, so a growing prefix is playable. A moov found only near EOF would
+    make the prefix unplayable, so sniff the head before handing it off.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(262144)
+    except OSError:
+        return False
+    return b"moov" in head
+
+
+def _early_audio_file_is_safe(path: str) -> bool:
+    """Path-based container check plus a moov-at-head sniff for m4a."""
+    if not _early_audio_path_is_safe(path):
+        return False
+    name = os.path.basename(path or "").lower()
+    name = re.sub(r"\.part-frag\d+$", "", name)
+    name = re.sub(r"\.frag\d+$", "", name)
+    for suffix in (".part", ".ytdl", ".temp"):
+        while name.endswith(suffix):
+            name = name[: -len(suffix)]
+    ext = name.rsplit(".", 1)[-1] if "." in name else ""
+    if ext in _EARLY_AUDIO_MOOV_CHECK_EXTS:
+        return _m4a_moov_at_head(path)
+    return True
 
 
 def _early_handoff_ready(downloaded: int, total: int = 0) -> bool:
@@ -2586,13 +2628,15 @@ _DOWNLOAD_LADDER: tuple = (
     {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
     {"_client": ["android_vr", "web_safari"]},                 # different API surface
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
-    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best",
+    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
+                "bestaudio[ext=m4a]/bestaudio/best",
      "_client": ["tv", "web"]},                                # format vanished
     # Last rung — never merge, never post-process. Fixes the recurring
     # "_stream_track failed ... YoutubeDL.post_process → run_all_pps"
     # crash, which is always an ffmpeg merge/convert failure on a DASH
     # video pair, by falling back to a single already-muxed file.
-    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best",
+    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
+                "bestaudio[ext=m4a]/bestaudio/best",
      "_no_merge": True},
     # ROOT-CAUSE FIX ("ERROR: The downloaded file is empty", repeated for every
     # rung, followed by "_stream_track failed"): YouTube hands SABR-only
@@ -2747,6 +2791,12 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
                     final_path = requested[0].get("filepath") or final_path
                 if final_path and os.path.exists(final_path):
                     path = final_path
+                if index or (info.get("vcodec") not in (None, "none")):
+                    LOGGER.info(
+                        "#download rung %d picked format_id=%s ext=%s vcodec=%s acodec=%s for %s",
+                        index + 1, info.get("format_id"), info.get("ext"),
+                        info.get("vcodec"), info.get("acodec"), url,
+                    )
                 # A SABR/expired-URL download can finish "successfully" with a
                 # zero-byte file. Treat that as a failed rung so the ladder
                 # keeps walking instead of handing an unplayable file to
@@ -2871,7 +2921,7 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
         # Never hand a growing MP4/M4A (moov atom at EOF) or a video file to
         # PyTgCalls. Audio-only WebM/Opus/MP3-style prefixes are the only safe
         # early sources; all other formats wait for the atomic final rename.
-        if not audio_only or not _early_audio_path_is_safe(fp or ""):
+        if not audio_only or not _early_audio_file_is_safe(fp or ""):
             return
         # Native fragment downloads do not consistently populate
         # `downloaded_bytes`; on Heroku this left the safe WebM prefix unseen
@@ -2932,7 +2982,7 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
             except OSError:
                 continue
             for cand in candidates:
-                if not audio_only or not _early_audio_path_is_safe(cand):
+                if not audio_only or not _early_audio_file_is_safe(cand):
                     continue
                 try:
                     size = os.path.getsize(cand)
