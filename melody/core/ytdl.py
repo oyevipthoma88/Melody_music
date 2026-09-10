@@ -1097,6 +1097,19 @@ else:
 #  yt-dlp options
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Terminal fallback used whenever NO audio-only format exists (HLS-only
+# extractions on blocked cloud IPs). Plain `best` there means a 1080p muxed
+# file of 60-95 MB and a 10s wait; the smallest muxed rendition carries the
+# same AAC audio in a few MB. Ordered smallest-usable first, `best` last so
+# the selector can never fail outright.
+_SMALL_MUXED_SELECTOR = (
+    "best[acodec!=none][height<=144]/"
+    "best[acodec!=none][height<=240]/"
+    "best[acodec!=none][height<=360]/"
+    "worst[acodec!=none]/worst/best"
+)
+
+
 def _ydl_opts(audio_only: bool = True) -> dict:
     """Return base yt-dlp options tuned for Heroku and bot-detection bypass.
 
@@ -1142,7 +1155,18 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # m4a (itag 140/139) is fragmented MP4 with headers FIRST, is ~5% of
         # the bytes, and is moov-verified before early handoff below.
         "bestaudio[ext=m4a]/bestaudio[format_id=140]/bestaudio[format_id=139]/"
-        "bestaudio[protocol=m3u8]/bestaudio[protocol=m3u8_native]/best"
+        "bestaudio[protocol=m3u8]/bestaudio[protocol=m3u8_native]/"
+        # Catch-all for audio-only formats yt-dlp exposes without an `abr`
+        # or a recognised ext (bestaudio* also matches HLS audio renditions).
+        "bestaudio*[vcodec=none]/"
+        # Sep 10 12:45 Heroku log fix: this host got an HLS-only extraction
+        # (no DASH audio at all), so the chain fell through to plain `best`
+        # and pulled itag 96 — 1080p muxed, 93 MB, ~10s. When only muxed
+        # formats exist, take the SMALLEST one that still has audio: itag
+        # 91/92/93 are a few MB and download in ~1s. Audio is re-encoded to
+        # 48kHz mono for the voice chat anyway, so low video res costs
+        # nothing.
+        f"{_SMALL_MUXED_SELECTOR}"
 
         if audio_only
         # ROOT-CAUSE FIX ("/vplay pe audio aur video mismatch"): a DASH
@@ -2629,14 +2653,14 @@ _DOWNLOAD_LADDER: tuple = (
     {"_client": ["android_vr", "web_safari"]},                 # different API surface
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
     {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
-                "bestaudio[ext=m4a]/bestaudio/best",
+                "bestaudio[ext=m4a]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "_client": ["tv", "web"]},                                # format vanished
     # Last rung — never merge, never post-process. Fixes the recurring
     # "_stream_track failed ... YoutubeDL.post_process → run_all_pps"
     # crash, which is always an ffmpeg merge/convert failure on a DASH
     # video pair, by falling back to a single already-muxed file.
     {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
-                "bestaudio[ext=m4a]/bestaudio/best",
+                "bestaudio[ext=m4a]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "_no_merge": True},
     # ROOT-CAUSE FIX ("ERROR: The downloaded file is empty", repeated for every
     # rung, followed by "_stream_track failed"): YouTube hands SABR-only
@@ -2649,13 +2673,13 @@ _DOWNLOAD_LADDER: tuple = (
      "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
                 "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
                 "bestaudio[format_id=251]/bestaudio[format_id=250]/bestaudio[format_id=249]/"
-                "bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio/best",
+                "bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "concurrent_fragment_downloads": 1, "_no_merge": True},
     {"_client": ["web_safari", "web_embedded"],
      "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
                 "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
                 "bestaudio[format_id=251]/bestaudio[format_id=140]/"
-                "bestaudio[protocol^=http]/bestaudio/best", "_no_merge": True},
+                "bestaudio[protocol^=http]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR, "_no_merge": True},
 )
 
 
