@@ -98,11 +98,16 @@ except Exception:  # noqa: BLE001
     _CONTROL_RPC_TIMEOUT = 5.0
 
 try:
+    # ⚡ 5-SECOND RULE: playback must be audible within ~5s of /play. Search
+    # costs ~0.5s, the VC join is ~0s (pre-joined silence), so the source race
+    # gets a hard 4s budget. Whatever is ready first — direct CDN URL or the
+    # early WebM/Opus prefix of the fallback download — starts the song; the
+    # rest keeps downloading in the background.
     _PLAY_START_BUDGET = max(
-        4.0, min(10.0, float(os.getenv("PLAY_START_BUDGET", "9.5")))
+        2.0, min(10.0, float(os.getenv("PLAY_START_BUDGET", "4.0")))
     )
 except Exception:  # noqa: BLE001
-    _PLAY_START_BUDGET = 8.5
+    _PLAY_START_BUDGET = 4.0
 try:
     # The source race is intentionally short, but a fallback download that has
     # already started must not be cancelled at that boundary. Give it its own
@@ -1530,6 +1535,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         source_errors = []
         direct_task = None
         download_task = None
+        early_task = None
         download_cancelled = False
         early_file = False
         pending: set = set()
@@ -1610,11 +1616,36 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 except Exception as exc:
                     LOGGER.debug("fallback archive skipped for %s: %s", track.video_id, exc)
 
+            early_task = None
             if not live_source and not direct_only_video:
                 download_task = asyncio.create_task(
                     _delayed_download(_DOWNLOAD_START_DELAY if direct_first else 0.0)
                 )
                 pending.add(download_task)
+
+                # ⚡ 5-SECOND RULE: do not wait for the whole download (8-9s in
+                # the Heroku logs) or for the direct resolver to give up. An
+                # audio-only download exposes a playable WebM/Opus prefix after
+                # a few hundred KB, so race that prefix as a first-class source.
+                # Whichever source is ready first wins the race and the song
+                # starts; the download keeps running to completion behind it.
+                if not video:
+                    async def _await_early_prefix():
+                        try:
+                            return await wait_for_early_download(
+                                track.video_id,
+                                audio_only=True,
+                                timeout=max(
+                                    0.5, startup_deadline - time.monotonic()
+                                ),
+                            )
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            return None
+                        except Exception:  # noqa: BLE001 - never fail the race
+                            return None
+
+                    early_task = asyncio.create_task(_await_early_prefix())
+                    pending.add(early_task)
         async def _finish_started_fallback():
             """Let an already-started fallback finish after the race budget.
 
@@ -1640,7 +1671,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     early_path = await wait_for_early_download(
                         track.video_id,
                         audio_only=not video,
-                        timeout=min(float(os.getenv("FASTPLAY_MAX_WAIT", "4.5")), _PLAY_FALLBACK_TIMEOUT),
+                        timeout=min(float(os.getenv("FASTPLAY_MAX_WAIT", "1.5")), _PLAY_FALLBACK_TIMEOUT),
                     )
                 except asyncio.TimeoutError:
                     # The prefix threshold is optional; a normal completed
@@ -1699,6 +1730,20 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 if task is direct_task and result is not None:
                     stream = result
                     break
+                if task is early_task and result:
+                    filepath = result
+                    early_file = bool(filepath.endswith(".early"))
+                    LOGGER.info(
+                        "⚡ #stream early-prefix handoff %s (instant start)",
+                        track.video_id,
+                    )
+                    if download_task is not None:
+                        spawn(
+                            _archive_download_task(download_task),
+                            name=f"archive:{track.video_id}",
+                        )
+                    stream = _local_media_stream(chat_id, filepath, video, start_at)
+                    break
                 if task is download_task and result:
                     filepath = result
                     early_file = bool(filepath and filepath.endswith(".early"))
@@ -1724,6 +1769,8 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         # after the direct-first grace window, so it cannot starve resolution.
         if direct_task is not None and direct_task in pending:
             direct_task.cancel()
+        if early_task is not None and not early_task.done():
+            early_task.cancel()
         if filepath is None and download_task is not None:
             if not download_task.done():
                 download_task.add_done_callback(_consume_task_exception)
