@@ -58,7 +58,7 @@ except Exception:  # noqa: BLE001
 # the cookie-authenticated yt-dlp path even gets a chance. Mute the host-level
 # InnerTube stream probe after consecutive failures and periodically re-test.
 try:
-    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "1")))
+    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "3")))
 except Exception:  # noqa: BLE001
     _IT_MUTE_AFTER = 1
 try:
@@ -1144,7 +1144,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # chat, and HLS/m4a cannot be handed off early (moov atom at EOF).
         # WebM/Opus carries its headers at the START, so the growing .part
         # file is playable within ~1s.
-        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 72)}]/"
+        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 128)}]/"
         "bestaudio[ext=webm][abr<=96]/"
         "bestaudio[ext=webm]/"
         "bestaudio[ext=opus]/bestaudio[ext=ogg]/"

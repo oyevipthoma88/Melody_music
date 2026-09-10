@@ -116,7 +116,7 @@ try:
     # ⚡ LONG-MIX FIX: Increased grace window to 90s (max 120s) so 1hr+ downloads don't crash
     _PLAY_FALLBACK_TIMEOUT = max(30.0, min(180.0, float(os.getenv("PLAY_FALLBACK_TIMEOUT", "30"))))
 except Exception:  # noqa: BLE001
-    _PLAY_FALLBACK_TIMEOUT = 120.0
+    _PLAY_FALLBACK_TIMEOUT = 30.0
 
 try:  # py-tgcalls raises this when the assistant is not connected to the VC
     from pytgcalls.exceptions import NotInCallError
@@ -958,7 +958,7 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
             ("http://127.0.0.1:", "http://localhost:")
         ):
             try:
-                if os.getenv('DISABLE_DIRECT_STREAM', '1') == '1':
+                if os.getenv('DISABLE_DIRECT_STREAM', '0') == '1':
                     raise ValueError('FastPlay: skip direct stream')
                 return await _build_direct_stream(
                     chat_id, track, video, seconds, force=True,
