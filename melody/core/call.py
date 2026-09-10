@@ -99,7 +99,7 @@ except Exception:  # noqa: BLE001
 
 try:
     _PLAY_START_BUDGET = max(
-        4.0, min(10.0, float(os.getenv("PLAY_START_BUDGET", "8.5")))
+        4.0, min(10.0, float(os.getenv("PLAY_START_BUDGET", "9.5")))
     )
 except Exception:  # noqa: BLE001
     _PLAY_START_BUDGET = 8.5
@@ -109,7 +109,7 @@ try:
     # bounded grace period so slow YouTube/CDN resolution does not become a
     # false playback crash.
     # ⚡ LONG-MIX FIX: Increased grace window to 90s (max 120s) so 1hr+ downloads don't crash
-    _PLAY_FALLBACK_TIMEOUT = max(120.0, min(180.0, float(os.getenv("PLAY_FALLBACK_TIMEOUT", "120")))))))
+    _PLAY_FALLBACK_TIMEOUT = max(30.0, min(180.0, float(os.getenv("PLAY_FALLBACK_TIMEOUT", "30"))))
 except Exception:  # noqa: BLE001
     _PLAY_FALLBACK_TIMEOUT = 120.0
 

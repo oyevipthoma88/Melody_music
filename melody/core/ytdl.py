@@ -40,18 +40,18 @@ try:
     # Keep direct resolution bounded because the local download races it. An
     # 8s resolver plus the Invidious rescue used to delay playback even when
     # the fallback file was already progressing.
-    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "2.0"))
+    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "4.0"))
 except ValueError:
-    _RESOLVE_TIMEOUT = 2.0
-_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "2.0")))
+    _RESOLVE_TIMEOUT = 4.0
+_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "4.0")))
 _RESOLVE_TIMEOUT = min(_RESOLVE_TIMEOUT, _DIRECT_RESOLVE_MAX)
 
 # How long InnerTube gets the CPU/network to itself before the heavy yt-dlp
 # fallback is started as well (see resolve_stream_urls).
 try:
-    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.10"))
+    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.20"))
 except Exception:  # noqa: BLE001
-    _INNERTUBE_HEADSTART = 0.10
+    _INNERTUBE_HEADSTART = 0.20
 
 # How long the fast metadata race (YouTube Data API v3 + InnerTube) is given
 # before falling back to yt-dlp. Kept short on purpose — see
@@ -1083,9 +1083,9 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # Prefer high-quality stereo audio. The configurable ceiling avoids
         # pulling an unnecessarily huge source on a small cloud worker while
         # still allowing 160kbps/192kbps sources when YouTube exposes them.
-        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 96)}]/"
-        "bestaudio[ext=webm][abr<=128]/"
-        "bestaudio[ext=opus]/bestaudio[abr<=128]/bestaudio/best"
+        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 160)}]/"
+        "bestaudio[ext=webm][abr<=192]/"
+        "bestaudio[ext=opus]/bestaudio[abr<=192]/bestaudio/best"
 
         if audio_only
         # ROOT-CAUSE FIX ("/vplay pe audio aur video mismatch"): a DASH
@@ -1217,9 +1217,9 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # SPEED FIX: a stuck CDN connection used to burn 15s per socket and
         # up to 8 retries per rung before the ladder even moved on — that is
         # the "kabhi kabhi _stream_track failed" case taking 20s+ first.
-        "socket_timeout": _env_int("YT_SOCKET_TIMEOUT", 5),
+        "socket_timeout": _env_int("YT_SOCKET_TIMEOUT", 8),
         "retries": _env_int("YT_RETRIES", 1),
-        "fragment_retries": _env_int("YT_FRAGMENT_RETRIES", 2),
+        "fragment_retries": _env_int("YT_FRAGMENT_RETRIES", 5),
         "extractor_retries": _env_int("YT_EXTRACTOR_RETRIES", 1),
         "file_access_retries": 3,
         # ROOT-CAUSE FIX (⚠️ "prefetch_next failed" →
@@ -1252,7 +1252,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # download with no pipe involved, sequential fragments only slow
         # the download down for no reason. 4 parallel fragments cuts
         # download time noticeably on typical DASH-fragmented audio.
-        "concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 8),  # ⚡ SPEED: 4→8
+        "concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 4),
         # yt-dlp's YouTube extractor needs an external JS runtime to solve
         # the player challenge and to run the bgutil PO-token script.
         # Only pin a path when a real binary exists — pointing js_runtimes at
@@ -2376,7 +2376,7 @@ _EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.01)
 # far faster than 1x realtime playback, so that prefix keeps growing well
 # ahead of the reader for the rest of a multi-hour file.
 _EARLY_HANDOFF_LARGE_FILE_BYTES = _env_int("EARLY_HANDOFF_LARGE_FILE_BYTES", 10_000_000)
-_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 131_072)  # ⚡ SPEED: 256KB→128KB
+_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 4_000_000)
 # ROOT-CAUSE FIX from the Aug 25 Heroku log:
 #   ffprobe check_stream failed (NoAudioSourceFound: No audio source found on
 #   "/tmp/melody_<id>_a.mp4.part")
@@ -2385,7 +2385,7 @@ _EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 1
 # containers reliably until the final atomic rename. Audio-only WebM/Opus/MP3
 # can opt into the validated prefix path below; the shared future and download
 # gate still wait for the complete file before any cache/persistence operation.
-_EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", True)  # ⚡ 5-SEC FIX: Enable on cloud for instant playback
+_EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", False) and not _ON_CLOUD_HOST
 # Audio-only WebM/Opus files carry their decode headers at the beginning and
 # can be consumed safely while yt-dlp keeps appending ordered clusters. Enable
 # this path on cloud hosts by default; video/MP4/M4A remain completion-only.
@@ -4609,7 +4609,7 @@ _stream_url_locks: dict = {}
 # the same resolver ladder three times. The short TTL still permits recovery
 # from transient YouTube/CDN changes.
 _stream_url_failures: dict = {}
-_STREAM_URL_FAILURE_TTL = 0.3
+_STREAM_URL_FAILURE_TTL = 8.0
 _STREAM_URL_FALLBACK_TTL = 1800  # used when the URL carries no `expire`
 _STREAM_URL_SAFETY_MARGIN = 300  # re-resolve this long before real expiry
 _STREAM_URL_CACHE_MAX = 128
@@ -5041,9 +5041,12 @@ async def resolve_stream_urls(
     # ⚡ SPEED FIX: force=True completely bypasses negative cache for instant retry
     failure_until = 0.0 if force else _stream_url_failures.get(key, 0.0)
     now = _time_mod.monotonic()
+    # A background warm resolve may have just recorded a transient failure;
+    # after the bounded cache age, allow the foreground request to retry.
+    # This is the background warm resolve recovery path.
     if failure_until > now and not force:
         failure_age = _STREAM_URL_FAILURE_TTL - (failure_until - now)
-        if failure_age >= 0.5:
+        if failure_age >= 0.75:
             raise ValueError("direct stream temporarily unavailable (cached failure)")
 
     if failure_until:
@@ -5059,7 +5062,7 @@ async def resolve_stream_urls(
         now = _time_mod.monotonic()
         if failure_until > now and not force:
             failure_age = _STREAM_URL_FAILURE_TTL - (failure_until - now)
-            if failure_age >= 0.5:
+            if failure_age >= 0.75:
                 raise ValueError("direct stream temporarily unavailable (cached failure)")
         if failure_until:
             _stream_url_failures.pop(key, None)
