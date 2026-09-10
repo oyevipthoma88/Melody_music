@@ -1242,7 +1242,17 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # web_safari is the reliable cloud escape hatch: yt-dlp documents
         # that its HLS formats do not need a GVS PO token. Keep default/iOS
         # behind it for ordinary HTTPS formats and compatibility fallback.
-        "player_client": ["web_safari", "android_vr", "default", "ios"],
+        # SPEED FIX (Heroku log 17:13-17:14: every mobile client answered
+        # LOGIN_REQUIRED, yet yt-dlp still probed android_vr/ios on every
+        # resolve — each one a wasted round-trip on the critical path, and
+        # the direct resolve cost 4.2-5.7s). Once this host is known to be
+        # blocked for mobile clients, ask ONLY the cookie-authenticated
+        # web/TV clients that actually answer here.
+        "player_client": (
+            ["web_safari", "default", "tv_simply"]
+            if (has_cookies and _innertube_stream_muted())
+            else ["web_safari", "android_vr", "default", "ios"]
+        ),
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.

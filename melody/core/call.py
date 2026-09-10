@@ -55,7 +55,13 @@ try:
     # The fallback downloader must start immediately. A fixed grace period
     # made a blocked/slow direct resolver add latency even though the fallback
     # was the only source that could eventually play on cloud dynos.
-    configured_download_delay = float(os.getenv("DOWNLOAD_START_DELAY", "1.5"))
+    # SPEED FIX (Heroku log after the direct-path fix: direct resolve won at
+    # 4.2-5.7s, but the fallback download had already started at 1.5s and then
+    # pulled a full 5-6 MB muxed file for 8.5s — on a 1-CPU dyno that is the
+    # bandwidth/CPU the resolve and the first ffmpeg frames were waiting for).
+    # _delayed_download() waits ON the direct task, so a direct failure still
+    # starts the download instantly; this only stops the pointless overlap.
+    configured_download_delay = float(os.getenv("DOWNLOAD_START_DELAY", "6.0"))
 except Exception:  # noqa: BLE001
     configured_download_delay = 0.0
 # Start direct resolution and the fallback downloader in parallel. The old
