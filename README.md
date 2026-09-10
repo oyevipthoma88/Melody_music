@@ -169,7 +169,7 @@ The full configuration template is in [`.env.example`](.env.example). The follow
 | `YT_COOKIES` | Strongly recommended for YouTube | Permitted YouTube cookie material in the supported configuration format. Keep it secret and rotate it. |
 | `BGUTIL_STARTUP_WARMUP` | Recommended | Warms the PO-token provider before first playback. |
 | `MAX_CONCURRENT_DOWNLOADS` | Recommended | Keep conservative on small hosts; `1` is a safe starting point. |
-| `PLAY_START_BUDGET` | Recommended | Strict playback source-start budget, capped by runtime at 10 seconds. |
+| `PLAY_START_BUDGET` | Recommended | Strict playback source-start budget (default 4s, capped at 10s) so playback starts within ~5 seconds. |
 | `MUSIC_ARCHIVE_CHANNEL_ID` | Optional | Explicit private archive channel; blank disables archival. |
 | `VC_CHAT_LOG_CHANNEL_ID` | Optional | Private VC chat-log backup channel. |
 | `PLAYBACK_RECOVERY` | Optional | Restart snapshot recovery; enable deliberately after testing. |
@@ -181,7 +181,7 @@ The full configuration template is in [`.env.example`](.env.example). The follow
 MAX_CONCURRENT_DOWNLOADS=1
 BGUTIL_STARTUP_WARMUP=true
 STARTUP_WARMUPS=false
-PLAY_START_BUDGET=9.5
+PLAY_START_BUDGET=4.0
 MUSIC_ARCHIVE_CHANNEL_ID=
 ```
 
