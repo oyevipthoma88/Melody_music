@@ -1,5 +1,5 @@
 """
-🎨 VC card theme — thin re-export of the single project-wide Melody theme.
+🎨 VC card theme — thin re-export of the single project-wide Apex Vibes theme.
 
 Every VC surface (join, left, invite, started, ended, chat log) keeps calling
 `vc_card()` / `headline()` / `tag()` exactly as before; the styling itself now

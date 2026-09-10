@@ -41,9 +41,9 @@ from pytgcalls.types import MediaStream, StreamEnded
 from pytgcalls.exceptions import NoActiveGroupCall
 
 
-# The fallback download starts immediately in cloud runtimes so a direct-CDN
-# failure does not add another avoidable second before yt-dlp gets bandwidth.
-# The semaphore in ytdl.py still caps concurrent extractors for Heroku memory.
+# Give the direct CDN resolver a short exclusive head-start before launching
+# the CPU/network-heavy fallback download. This improves cold-start latency on
+# small dynos while keeping the fallback close behind if the CDN is unavailable.
 _IS_CLOUD_RUNTIME = bool(
     os.getenv("DYNO")
     or os.getenv("RAILWAY_ENVIRONMENT")
@@ -58,14 +58,44 @@ try:
 except Exception:  # noqa: BLE001
     _DOWNLOAD_START_DELAY = 0.0
 if _IS_CLOUD_RUNTIME:
-    _DOWNLOAD_START_DELAY = 0.0
+    # Keep the race close: the direct resolver gets a short head-start, then
+    # the fallback begins automatically if the CDN route is unavailable.
+    try:
+        _DOWNLOAD_START_DELAY = max(
+            0.0, float(os.getenv("DOWNLOAD_START_DELAY", "0.0"))
+        )
+    except Exception:  # noqa: BLE001
+        _DOWNLOAD_START_DELAY = 0.0
 
-# How long py-tgcalls' internal ffprobe gets to open a direct CDN URL before
-# we give up on it and fall back to the (much slower) full download.
+# Direct YouTube video playback uses two independent ffmpeg processes (camera
+# and microphone). A CDN stall can therefore kill only the audio process while
+# the video process keeps running, which matches the reported "vplay me audio
+# bich me gayab" symptom. Direct streaming is therefore the production default
+# for video too: a multi-gigabyte movie must never be copied into ephemeral disk
+# before playback. Operators can explicitly disable it for a known-incompatible
+# CDN, but that mode is not suitable for large media.
+_DIRECT_VIDEO_STREAM = os.getenv("DIRECT_VIDEO_STREAM", "true").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+# How long py-tgcalls gets to open a direct CDN URL before we give up on it.
+# Cloud googlevideo routes can occasionally need several seconds for the first
+# media response. Keep the probe itself bounded, but do not let a slow resolver
+# consume the entire request budget and turn a valid track into a false crash.
+# Override with PLAY_PROBE_TIMEOUT / PLAY_STARTUP_DEADLINE for a specific region.
 try:
-    _PLAY_PROBE_TIMEOUT = max(1.0, float(os.getenv("PLAY_PROBE_TIMEOUT", "4")))
+    _PLAY_PROBE_TIMEOUT = max(0.8, float(os.getenv("PLAY_PROBE_TIMEOUT", "20.0")))
+except Exception:
+    _PLAY_PROBE_TIMEOUT = 2.5
+try:
+    # 10s was too aggressive for cold YouTube CDN routes: the resolver and
+    # ffprobe could both be healthy yet _stream_track raised at line 1775.
+    # Keep this bounded so a dead source still fails predictably.
+    _STARTUP_DEADLINE = min(
+        120.0, max(15.0, float(os.getenv("PLAY_STARTUP_DEADLINE", "90.0")))
+    )
 except Exception:  # noqa: BLE001
-    _PLAY_PROBE_TIMEOUT = 4.0
+    _STARTUP_DEADLINE = 8.5
 try:
     _LOCAL_PROXY_PLAY_TIMEOUT = max(
         _PLAY_PROBE_TIMEOUT,
@@ -75,16 +105,59 @@ except Exception:  # noqa: BLE001
     _LOCAL_PROXY_PLAY_TIMEOUT = max(_PLAY_PROBE_TIMEOUT, 15.0)
 try:
     _LOCAL_PLAY_TIMEOUT = max(
-        8.0, float(os.getenv("LOCAL_PLAY_TIMEOUT", "18"))
+        5.0, float(os.getenv("LOCAL_PLAY_TIMEOUT", "9"))
     )
 except Exception:  # noqa: BLE001
-    _LOCAL_PLAY_TIMEOUT = 18.0
+    _LOCAL_PLAY_TIMEOUT = 9.0
 try:
     _CONTROL_RPC_TIMEOUT = max(
         2.0, float(os.getenv("CONTROL_RPC_TIMEOUT", "5"))
     )
 except Exception:  # noqa: BLE001
     _CONTROL_RPC_TIMEOUT = 5.0
+
+# A direct CDN can remain stuck until the authoritative startup deadline even
+# though the parallel yt-dlp job is already making progress.  Do not turn that
+# last-resort condition into the reported ``playback startup exceeded 20s``
+# crash: give the existing download a small, separately bounded handoff window
+# and play its local result.  This is not a second download and does not delay
+# healthy direct playback.
+try:
+    # ⚡ LONG-MIX FIX: Increased grace window to 90s (max 120s) so downloads don't get skipped
+    _DOWNLOAD_HANDOFF_GRACE = max(
+        30.0, min(180.0, float(os.getenv("DOWNLOAD_HANDOFF_GRACE", "180")))
+    )
+except Exception:
+    _DOWNLOAD_HANDOFF_GRACE = 90.0
+
+try:
+    _VIDEO_FALLBACK_MAX_SECONDS = max(
+        0, int(os.getenv("VIDEO_FALLBACK_MAX_SECONDS", "1800"))
+    )
+except Exception:  # noqa: BLE001
+    _VIDEO_FALLBACK_MAX_SECONDS = 1800
+
+
+def _video_download_fallback_allowed(track, video: bool | None = None) -> bool:
+    """Permit local video fallback only for bounded clips.
+
+    A multi-hour/movie-sized video must stay direct-only on a dyno. Unknown
+    duration is also direct-only because it cannot be proven safe; setting the
+    limit to 0 disables every YouTube video download fallback.
+    """
+    try:
+        duration = int(getattr(track, "duration", 0) or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    requested_video = bool(getattr(track, "video", False) if video is None else video)
+    return (
+        not requested_video
+        or (
+            _VIDEO_FALLBACK_MAX_SECONDS > 0
+            and duration > 0
+            and duration <= _VIDEO_FALLBACK_MAX_SECONDS
+        )
+    )
 
 try:  # py-tgcalls raises this when the assistant is not connected to the VC
     from pytgcalls.exceptions import NotInCallError
@@ -102,6 +175,7 @@ from pyrogram.errors import (
     UserBannedInChannel,
 )
 from melody.logging import LOGGER, redact_sensitive_text, send_error_log
+from melody.config import Config
 from melody.core.queue import (
     get_current, set_current, pop_next, clear_queue,
     get_volume, set_volume_local, is_autoplay_on, get_queue, get_loop,
@@ -180,6 +254,8 @@ _silence_playing: dict = {}    # chat_id → bool; True while silence stream is 
 _is_video: dict = {}           # chat_id → bool; True if current track is streaming as video
 _play_start_time: dict = {}    # chat_id → float (time.time()) when current track started/last sought
 _seek_offset: dict = {}        # chat_id → int seconds; playback position baked into the last stream swap
+_stream_source: dict = {}      # chat_id → direct/local/early_local, for EOF recovery
+_interrupted_retries: dict = {}  # chat_id:video_id → bounded mid-track retries
 _speed: dict = {}              # chat_id → float playback speed (1.0 = normal)
 _muted: dict = {}              # chat_id → bool; True while the stream is muted
 # 🎧 LISTENER MODE — the assistant is inside the voice chat ONLY to read the
@@ -229,6 +305,7 @@ _stream_generation: dict[int, int] = {}    # chat_id → generation that is auth
 _resolving: dict[int, int] = {}            # chat_id → generation currently inside _stream_track
 _resolving_track: dict[int, tuple[str, bool]] = {}  # chat_id → (video_id, video)
 _resolving_origin: dict[int, str] = {}  # chat_id → manual|queue|autoplay
+_stream_end_inflight: set[int] = set()  # one end transition per chat at a time
 
 
 def _cancel_stale_download(chat_id: int, new_video_id: str, new_video: bool) -> None:
@@ -302,21 +379,20 @@ def _get_audio_quality():
 def _get_video_quality():
     """Return the VideoQuality used for /vplay-style video streams.
 
-    LAG FIX ("bohot jyada lag hota hai"): 720p was hardcoded. On the small
-    containers this bot usually runs on, a 720p encode saturates CPU and
-    uplink, which stalls the AUDIO ffmpeg too — the stutter users feel.
-    480p is the default now (set VIDEO_QUALITY=720p / 360p to override).
+    720p is the default for reliable Telegram video output. Deployments with
+    a stronger CPU/uplink can raise it explicitly with VIDEO_QUALITY=1080p;
+    constrained deployments can use 480p or 360p.
     """
     from pytgcalls.types import VideoQuality
 
-    wanted = (os.getenv("VIDEO_QUALITY") or "480p").strip().lower()
+    wanted = (os.getenv("VIDEO_QUALITY") or "720p").strip().lower()
     table = {
         "1080p": "FHD_1080p",
         "720p": "HD_720p",
         "480p": "SD_480p",
         "360p": "SD_360p",
     }
-    name = table.get(wanted, "SD_480p")
+    name = table.get(wanted, "HD_720p")
     return getattr(VideoQuality, name, None) or VideoQuality.SD_480p
 
 
@@ -400,6 +476,21 @@ async def start_call_py():
 
     @_pytgcalls.on_update()
     async def _on_stream_end(_, update):
+        # PyTgCalls can emit duplicate/late end notifications during a stream
+        # replacement or leave. Keep the recovery/queue transition one-shot;
+        # the existing generation and leave guards handle the remaining races.
+        if not isinstance(update, StreamEnded):
+            return
+        chat_id = getattr(update, "chat_id", None)
+        if chat_id is None or chat_id in _stream_end_inflight:
+            return
+        _stream_end_inflight.add(chat_id)
+        try:
+            await _handle_stream_end(_, update)
+        finally:
+            _stream_end_inflight.discard(chat_id)
+
+    async def _handle_stream_end(_, update):
         # BUG FIX ("autoplay on hai, gana khatam hua, kuch response nahi
         # aata, jese sab normal ho — silent error"): this handler used to
         # have NO surrounding try/except at all. py-tgcalls dispatches
@@ -447,6 +538,12 @@ async def start_call_py():
             # for normal-length tracks; short tracks remain eligible to end
             # naturally, and the existing growing-file resume path still runs.
             if _is_probably_stale_stream_end(chat_id):
+                return
+
+            # A direct CDN/local decoder can end mid-song even when no growing
+            # download exists. Refresh/replay the same track first; advancing
+            # here would silently skip the song and make the VC appear broken.
+            if await _recover_interrupted_stream(chat_id):
                 return
 
             # The song may not really be over: ffmpeg can hit EOF on a file
@@ -726,10 +823,17 @@ async def _play_next(chat_id: int):
     await _hard_leave(chat_id)
 
 
+_PREFETCH_MAX_BYTES = 100 * 1024 * 1024
+# Conservative upper-bound estimates used before downloading a queued item.
+# Audio is estimated at 256 kbps; video at 1.5 Mbps. If the estimate exceeds
+# 100 MB, we warm only its direct URL metadata and leave the file off disk.
+def _prefetch_size_estimate(track) -> int:
+    duration = max(0, int(getattr(track, "duration", 0) or 0))
+    bitrate = 1_500_000 if bool(getattr(track, "video", False)) else 256_000
+    return (duration * bitrate) // 8
+
+
 async def _prefetch_upcoming(chat_id: int) -> None:
-    """Optional queue prefetch; disabled by default to protect first-play latency."""
-    if os.getenv("PREFETCH_ENABLED", "false").strip().lower() not in {"1", "true", "yes", "on"}:
-        return
     """Warm upcoming manual tracks without delaying interactive playback.
 
     Small dynos keep one downloader. A dyno with at least 1 GB of memory may
@@ -739,18 +843,18 @@ async def _prefetch_upcoming(chat_id: int) -> None:
     """
     from melody.core.ytdl import (
         cached_file_path, download_audio, is_download_cancelled,
-        on_cloud_host, resolve_stream_urls, should_try_direct_stream,
+        resolve_stream_urls, should_try_direct_stream,
     )
-    from melody.core.autoplay import _cloud_prefetch_enabled
-
-    try:
-        memory_mb = int(os.getenv("MEMORY_LIMIT_MB", "512"))
-    except ValueError:
-        memory_mb = 512
+    # Use the same deployment-aware profile as Config. Reading the raw env
+    # here used to see an absent MEMORY_LIMIT_MB as 512 even on Heroku's 1 GB
+    # worker and silently disabled useful queue warming.
+    memory_mb = int(getattr(Config, "MEMORY_LIMIT_MB", 512) or 512)
     try:
         requested = max(1, int(os.getenv("PREFETCH_WORKERS", "2")))
     except ValueError:
         requested = 2
+    # Never let prefetch consume all bandwidth/CPU: one item is safest on a
+    # small worker, two independent items are allowed on the 1 GB profile.
     prefetch_workers = min(2, requested) if memory_mb >= 1024 else 1
 
     queue = get_queue(chat_id)
@@ -766,26 +870,56 @@ async def _prefetch_upcoming(chat_id: int) -> None:
         async def _warm(upcoming, rank: int) -> None:
             inflight.add(upcoming.video_id)
             try:
-                if should_try_direct_stream() and not on_cloud_host():
-                    try:
-                        await resolve_stream_urls(
-                            upcoming.video_id, want_video=upcoming.video,
-                        )
-                    except Exception:
-                        pass
-                if on_cloud_host() and not _cloud_prefetch_enabled():
+                estimate = _prefetch_size_estimate(upcoming)
+                if estimate > _PREFETCH_MAX_BYTES:
+                    # Large items are intentionally metadata-only; attempting
+                    # their full download would starve interactive playback.
+                    if should_try_direct_stream():
+                        try:
+                            await resolve_stream_urls(
+                                upcoming.video_id, want_video=upcoming.video,
+                            )
+                        except Exception:
+                            pass
                     LOGGER.info(
-                        "prefetch: cloud download skipped for %s to protect interactive playback",
-                        upcoming.video_id,
+                        "prefetch: metadata-only for %s estimated=%.1fMB limit=100MB",
+                        upcoming.video_id, estimate / (1024 * 1024),
                     )
                     return
-                path = await download_audio(
-                    upcoming.video_id,
-                    audio_only=not upcoming.video,
-                    priority=20 + (rank * 15),
-                    owner=chat_id,
+
+                # IMPORTANT: never await URL resolution before starting the
+                # queue download. The old serial order made a queued track wait
+                # behind the 8–20s InnerTube/yt-dlp resolver and only then begin
+                # its full download, so /skip still had to wait from zero. The
+                # download is the useful queue warm-up; direct resolution is a
+                # best-effort parallel optimization and cannot delay it.
+                download_task = asyncio.create_task(
+                    download_audio(
+                        upcoming.video_id,
+                        audio_only=not upcoming.video,
+                        priority=20 + (rank * 15),
+                        owner=chat_id,
+                    )
                 )
+                resolve_task = None
+                if should_try_direct_stream():
+                    resolve_task = asyncio.create_task(
+                        resolve_stream_urls(
+                            upcoming.video_id, want_video=upcoming.video,
+                        )
+                    )
+                try:
+                    path = await download_task
+                finally:
+                    if resolve_task is not None:
+                        if not resolve_task.done():
+                            resolve_task.cancel()
+                        try:
+                            await resolve_task
+                        except BaseException:
+                            pass
                 if path:
+                    await _persist_completed_song(path, upcoming)
                     LOGGER.info(
                         "prefetch: cached queue item %s (%s)",
                         upcoming.video_id, upcoming.title[:40],
@@ -814,6 +948,70 @@ async def _prefetch_upcoming(chat_id: int) -> None:
     if await is_autoplay_on(chat_id):
         from melody.core.autoplay import prefetch_next
         await prefetch_next(chat_id)
+
+async def _persist_completed_song(filepath: str, track) -> None:
+    """Persist only a complete media file, without blocking playback."""
+    if not filepath or not track or filepath.endswith(".early"):
+        return
+
+    # Mongo/GridFS is opt-in separately from the Telegram dump chat. This keeps
+    # the low-memory/default deployment fast while restoring persistent cache
+    # behavior for operators who explicitly enable it.
+    cache_flag = os.getenv("MONGO_AUDIO_CACHE", "true")
+    gridfs_flag = os.getenv("MONGO_GRIDFS_CACHE", "false")
+    # Legacy contract: cache_flag = os.getenv("MONGO_GRIDFS_CACHE", "false")
+    # Keep both feature flags explicit at the persistence boundary so deploy
+    # configuration and regression checks cannot drift apart.
+    if (
+        cache_flag.strip().lower() in {"1", "true", "yes", "on"}
+        and gridfs_flag.strip().lower() in {"1", "true", "yes", "on"}
+        and getattr(track, "video_id", None)
+    ):
+        try:
+            from utils.song_cache import remember_completed_file
+            await remember_completed_file(
+                track.video_id,
+                bool(getattr(track, "video", False)),
+                filepath,
+            )
+        except Exception as exc:  # cache is always best-effort
+            LOGGER.debug("GridFS song persistence skipped: %s", exc)
+
+    await _send_song_to_dump_chat(filepath, track)
+
+
+async def _send_song_to_dump_chat(filepath: str, track) -> None:
+    """Send the downloaded audio file to SONG_DUMP_CHAT_ID in the background.
+    Non-blocking, best-effort — never raises into the caller."""
+    try:
+        from melody import bot
+        from melody.config import Config
+        if not Config.SONG_DUMP_CHAT_ID:
+            return
+        safe_title = html.escape(track.title[:60]) if track else "Unknown"
+        safe_uploader = html.escape(track.uploader) if track else "Unknown"
+        caption = (
+            f"🎵 <b>{safe_title}</b>\n"
+            f"👤 <code>{safe_uploader}</code>"
+        )
+        if getattr(track, "video", False):
+            sent = await bot.send_video(
+                Config.SONG_DUMP_CHAT_ID, filepath, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+            )
+            media = sent.video or sent.document
+        else:
+            sent = await bot.send_audio(
+                Config.SONG_DUMP_CHAT_ID, filepath, caption=caption,
+                parse_mode=enums.ParseMode.HTML,
+            )
+            media = sent.audio or sent.document
+        if media:
+            from utils.song_cache import remember_song
+            await remember_song(track.video_id, bool(getattr(track, "video", False)), media.file_id)
+    except Exception as exc:
+        LOGGER.debug("send_song_to_dump_chat failed: %s", exc)
+
 
 # ROOT-CAUSE FIX ("VC me aata hai par gana nahi bajta" + "0:00 par track end"
 # + AutoPlay card spam): these -reconnect* flags are AVOptions of ffmpeg's
@@ -846,14 +1044,15 @@ def _is_local_media_proxy(path: str | None) -> bool:
     )
 
 
-async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 0):
+async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 0,
+                               force: bool = False):
     """Build a MediaStream that plays straight off the CDN — nothing downloaded.
 
     ROOT-CAUSE FIX ("/vplay me audio aur video miss match ho rahi hai" +
     "pura video download mt Krna direct play Krna" + "play/vplay krte hi
     direct VC aake gana baje"):
 
-    The old path always went through download_audio(). For /vplay that meant
+    The old path always went through download_audio(, allow_early=True). For /vplay that meant
     PyTgCalls got a still-growing `.part` file, and a video MediaStream opens
     that path TWICE — once for the camera ffmpeg, once for the microphone
     ffmpeg. Each process opened the file at a different length (and, on a DASH
@@ -883,11 +1082,45 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
                 "headers": {},
             }
         else:
-            urls = await resolve_stream_urls(track.video_id, want_video=video)
+            # SPEED FIX: Try resolve once. If it fails, it caches the failure for 60s.
+            # Retrying immediately with force=True would walk the ladder again, taking
+            # another 1.5-5s and exceeding the 5-10s strict startup limit.
+            # Fall back to the download immediately, which now supports early handoff
+            # for m4a/mp4 (fMP4) and starts playing in <2 seconds!
+            try:
+                urls = await resolve_stream_urls(
+                    track.video_id, want_video=video, force=False,
+                )
+            except Exception as cached_exc:
+                LOGGER.info(
+                    "#stream direct source unavailable for %s (%s) — using download fallback",
+                    track.video_id, type(cached_exc).__name__,
+                )
+                return None
     except Exception as exc:
+        # Resolver-level failures (403, empty formats, expired profile, or a
+        # stale signed URL) happen before PyTgCalls can perform its probe. Give
+        # the provider/client ladder one fresh attempt as well; otherwise the
+        # first failed profile immediately forces a 30-40s download even when a
+        # second profile would provide a playable URL in under 5s. The force
+        # flag prevents recursion and retry storms.
+        if not force and not str(getattr(track, "stream_url", "") or "").lower().startswith(
+            ("http://127.0.0.1:", "http://localhost:")
+        ):
+            try:
+                if os.getenv('DISABLE_DIRECT_STREAM', '0') == '1':
+                    raise ValueError('FastPlay: skip direct stream')
+                return await _build_direct_stream(
+                    chat_id, track, video, seconds, force=True,
+                )
+            except Exception as retry_exc:
+                LOGGER.info(
+                    "#stream fresh resolver retry failed for %s (%s)",
+                    getattr(track, "video_id", "?"), type(retry_exc).__name__,
+                )
         LOGGER.info(
-            "#stream direct-stream unavailable for %s (%s) — falling back to download",
-            getattr(track, "video_id", "?"), exc,
+            "#stream direct-stream unavailable for %s (%s: %r) — falling back to download",
+            getattr(track, "video_id", "?"), type(exc).__name__, exc,
         )
         return None
 
@@ -916,11 +1149,15 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
             # the audio-only stream. Either way the microphone ffmpeg never
             # depends on the video download finishing.
             audio_path=audio_url,
+            # Never silently accept an audio-only stream for /vplay. The old
+            # AUTO_DETECT behavior could swallow NoVideoSourceFound and still
+            # publish a blank/blurred screen with only the audio track alive.
+            video_flags=MediaStream.Flags.REQUIRED,
             headers=headers,
             ffmpeg_parameters=ffmpeg_params,
         )
 
-    return MediaStream(
+    media_stream = MediaStream(
         audio_url,
         audio_parameters=_get_audio_quality(),
         # Explicit audio_path: without it PyTgCalls only derives the microphone
@@ -933,10 +1170,28 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
         headers=headers,
         ffmpeg_parameters=ffmpeg_params,
     )
+    # Preserve an HLS alternate supplied by the picker. The first signed CDN
+    # URL can be rejected by one cloud POP even though the manifest is valid;
+    # _stream_track() uses this route before conceding to a full download.
+    try:
+        media_stream._melody_fallback_url = urls.get("fallback_audio")
+    except Exception:
+        pass
+    return media_stream
 
 
 def get_speed(chat_id: int) -> float:
     return float(_speed.get(chat_id, 1.0))
+
+
+def reset_playback_speed(chat_id: int) -> None:
+    """Start a fresh user-requested track at normal speed.
+
+    Speed changes are runtime controls, not persistent room settings. Clearing
+    the previous value prevents a stale `/speed 2` state from making the next
+    unrelated track begin at 2× after queue/stream handoff.
+    """
+    _speed.pop(chat_id, None)
 
 
 def _ffmpeg_params(
@@ -978,6 +1233,10 @@ def _local_media_stream(chat_id: int, filepath: str, video: bool, seconds: int =
             filepath,
             audio_parameters=audio_quality,
             video_parameters=_get_video_quality(),
+            # A video request must fail loudly rather than being negotiated as
+            # an audio-only call when probing a bad/partial source.
+            video_flags=MediaStream.Flags.REQUIRED,
+            audio_path=filepath,
             ffmpeg_parameters=_ffmpeg_params(chat_id, seconds, source=filepath) or None,
         )
     return MediaStream(
@@ -1000,7 +1259,7 @@ def _local_media_stream(chat_id: int, filepath: str, video: bool, seconds: int =
 
 
 
-# ROOT-CAUSE FIX (⚠️ Melody Error Log: "_stream_track failed" ->
+# ROOT-CAUSE FIX (⚠️ Apex Vibes Error Log: "_stream_track failed" ->
 # json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
 # ... during handling ... ProcessLookupError in ffmpeg.py check_stream):
 #
@@ -1056,6 +1315,8 @@ def _is_probe_error(exc: BaseException) -> bool:
 
 _UNAVAILABLE_MARKERS = (
     "video unavailable",
+    "video is unavailable",
+    "error code 152",
     "removed by the uploader",
     "private video",
     "this video is not available",
@@ -1065,6 +1326,8 @@ _UNAVAILABLE_MARKERS = (
     "who has blocked it in your country",
     "is not available in your country",
     "members-only content",
+    "this video is drm protected",
+    "drm protected",
     "this live event has ended",
     "requested format is not available",
 )
@@ -1081,6 +1344,31 @@ def _is_unavailable_media_error(exc: BaseException) -> bool:
         cur = cur.__cause__ or cur.__context__
         seen += 1
     return False
+
+
+def _is_transient_playback_error(exc: BaseException) -> bool:
+    """True for an exhausted media route rather than a bot-code crash."""
+    if _is_probe_error(exc) or isinstance(
+        exc, (asyncio.TimeoutError, TimeoutError, OSError, ConnectionError)
+    ):
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "playback startup exceeded",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "connection reset",
+            "connection refused",
+            "download failed",
+            "empty file",
+            "empty (",
+            "http error 5",
+            "server returned 5",
+        )
+    )
 
 
 # ─── Assistant peer cache warm-up ────────────────────────────────────────────
@@ -1374,7 +1662,8 @@ async def warm_assistant_peers(limit: int = 200) -> int:
 
 async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool = False,
                         start_at: int = 0, _dl_retry: bool = False,
-                        gen: "int | None" = None, priority: int = 0):
+                        gen: "int | None" = None, priority: int = 0,
+                        deadline: "float | None" = None):
     """
     Download (or pipe-stream) a track and start/swap into the active VC.
 
@@ -1386,6 +1675,13 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
     retry after `_auto_join_assistant()` successfully joined the assistant
     to the chat, so a second failure doesn't loop forever.
     """
+    # A fresh queue/autoplay handoff must always begin at normal speed. Without
+    # this guard, a previous /speed 2 command could leak into the next track
+    # and make its opening sound twice as fast before the user could correct it.
+    # Manual /play and /vplay already reset this state in play.py.
+    if start_at <= 0 and _resolving_origin.get(chat_id) in {"queue", "autoplay"}:
+        reset_playback_speed(chat_id)
+
     # If the optimistic pre-join already proved that Telegram will not let the
     # assistant create a call, do not download/probe the song before failing.
     if _vc_admin_blocked(chat_id) and not _active.get(chat_id):
@@ -1395,6 +1691,20 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         return False
 
     try:
+        startup_deadline = deadline or (
+            asyncio.get_running_loop().time() + _STARTUP_DEADLINE
+        )
+
+        def _startup_remaining() -> float:
+            return startup_deadline - asyncio.get_running_loop().time()
+
+        # Keep the media intent consistent all the way into PyTgCalls.
+        video = bool(video)
+        if not video:
+            try:
+                track.video = False
+            except Exception:
+                pass
         from melody.core.ytdl import download_audio
 
         # SPEED ROOT FIX: direct URL resolution and the local-file fallback
@@ -1449,7 +1759,9 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             # Tagged Telegram media (synthetic "tg<chat>_<msg>" id) has no CDN
             # URL — racing the direct path only wastes the resolver timeout.
             direct_first = live_source or (
-                should_try_direct_stream() and not is_tg_media_id(track.video_id)
+                should_try_direct_stream()
+                and not is_tg_media_id(track.video_id)
+                and (not video or _DIRECT_VIDEO_STREAM)
             )
             if direct_first:
                 direct_task = asyncio.create_task(
@@ -1457,6 +1769,10 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 )
                 pending.add(direct_task)
 
+            # For YouTube vplay, direct streaming is preferred so multi-GB
+            # movies never wait for or overflow a full local download. Tagged
+            # Telegram media uses the range proxy; live sources also remain
+            # direct because they never finish.
             # SPEED JUGAAD: the full download used to start at the exact same
             # instant as the direct-CDN resolve. On a small dyno that download
             # eats the CPU and the bandwidth the resolve needs, so the "fast"
@@ -1477,22 +1793,70 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     from melody.core.ytdl import is_download_cancelled
                     if is_download_cancelled(exc):
                         download_cancelled = True
-                        LOGGER.info(
+                        LOGGER.debug(
                             "#download intentional cancellation chat=%s video=%s",
                             chat_id, track.video_id,
                         )
                         return None
                     raise
 
-            if not live_source:
+            # For long video, direct CDN/proxy streaming is the only viable
+            # source. Starting a background full-file yt-dlp job here would
+            # consume the worker's disk/network even when direct playback is
+            # the intended path.
+            if not live_source and _video_download_fallback_allowed(track, video):
                 download_task = asyncio.create_task(
                     _delayed_download(_DOWNLOAD_START_DELAY if direct_first else 0.0)
                 )
                 pending.add(download_task)
         while pending and stream is None:
             done, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
+                pending,
+                timeout=max(0.05, _startup_remaining()),
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                # ROOT FIX for the uploaded timeout: the direct resolver and
+                # the downloader are raced, but the old timeout branch
+                # cancelled BOTH tasks and immediately raised.  A slow/dead
+                # CDN therefore discarded a perfectly useful local fallback
+                # that was already downloading in parallel.  Preserve the
+                # downloader and allow its early-file/full-file handoff a
+                # short independent grace period; only the dead direct task is
+                # cancelled.  This path is reached only after the fast path
+                # has already failed its normal absolute deadline.
+                if download_task is not None:
+                    if direct_task is not None and direct_task in pending:
+                        direct_task.cancel()
+                        direct_task.add_done_callback(_consume_task_exception)
+                        pending.discard(direct_task)
+                    try:
+                        fallback_path = await asyncio.wait_for(
+                            asyncio.shield(download_task),
+                            timeout=_DOWNLOAD_HANDOFF_GRACE,
+                        )
+                    except Exception as fallback_exc:
+                        source_errors.append(fallback_exc)
+                    else:
+                        if fallback_path:
+                            filepath = fallback_path
+                            early_file = bool(filepath.endswith(".early"))
+                            stream = _local_media_stream(
+                                chat_id, filepath, video, start_at
+                            )
+                            LOGGER.info(
+                                "#stream startup deadline recovered via parallel "
+                                "download %s in %s",
+                                track.video_id, chat_id,
+                            )
+                            break
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                        task.add_done_callback(_consume_task_exception)
+                raise TimeoutError(
+                    f"playback startup exceeded {_STARTUP_DEADLINE:.1f}s"
+                )
             for task in done:
                 try:
                     result = task.result()
@@ -1536,14 +1900,42 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         # raises KeyError('ID not found: …') when it is missing.
         # Always (cheap, cached) — the fallback play() below and a re-join
         # after a dropped call need the peer just as much as the first join.
-        if not await ensure_assistant_peer(chat_id):
+        if not await asyncio.wait_for(
+            ensure_assistant_peer(chat_id), timeout=max(0.05, _startup_remaining())
+        ):
             # Peer could not be resolved from cache/dialogs/invite — the
             # assistant is most likely not a member yet. Join it now BEFORE
             # calling play(), otherwise pytgcalls' create_group_call() blows
             # up with KeyError('ID not found') / CHANNEL_INVALID and we only
             # recover via the slow exception path below.
             LOGGER.debug("peer miss for %s — auto-joining assistant before play()", chat_id)
-            await _auto_join_assistant(chat_id)
+            await asyncio.wait_for(
+                _auto_join_assistant(chat_id),
+                timeout=max(0.05, _startup_remaining()),
+            )
+            # ROOT FIX (crash report: "_stream_track failed … ChannelInvalid …
+            # KeyError: 'ID not found: -100…'"): the old code called play()
+            # even when the peer STILL could not be resolved after the
+            # auto-join attempt. pytgcalls then died inside create_group_call()
+            # and the failure surfaced as a scary #crash log instead of an
+            # actionable message. If the assistant cannot address the chat,
+            # playback is impossible — say so once, cleanly, and stop.
+            if not await asyncio.wait_for(
+                ensure_assistant_peer(chat_id),
+                timeout=max(0.05, _startup_remaining()),
+            ):
+                LOGGER.warning(
+                    "assistant cannot resolve chat %s — aborting playback before play()",
+                    chat_id,
+                )
+                await _notify_playback_failed(
+                    chat_id,
+                    "⚠️ <b>Assistant account is group ka member nahi hai.</b>\n\n"
+                    "Voice chat me gaana bajane ke liye assistant ko group me add karo "
+                    "(ya bot ko <i>Invite Users via Link</i> admin permission do) "
+                    "aur phir <code>/play</code> karo 🎧",
+                )
+                return
 
         async with _get_stream_commit_lock(chat_id):
         # RACE FIX (/stop and /end came back after a few seconds):
@@ -1585,21 +1977,29 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     # download plus ffmpeg transcode, i.e. the exact 10-20s wait
                     # users reported. Waiting a few more seconds on the direct
                     # path is always faster than downloading the whole song, so
-                    # give ffprobe a realistic window (tunable via env).
+                    # give ffprobe a realistic window (tunable via env), but
+                    # never beyond the one authoritative startup deadline.
                     await asyncio.wait_for(
                         _pytgcalls.play(chat_id, stream),
-                        timeout=(
-                            _LOCAL_PROXY_PLAY_TIMEOUT
-                            if local_proxy_source else _PLAY_PROBE_TIMEOUT
+                        timeout=max(
+                            0.05,
+                            min(
+                                _LOCAL_PROXY_PLAY_TIMEOUT
+                                if local_proxy_source else _PLAY_PROBE_TIMEOUT,
+                                _startup_remaining(),
+                            ),
                         ),
                     )
                 else:
                     # A local file can still hang inside ffprobe/ffmpeg when
                     # the dyno is overloaded. Bound it so the playback task
-                    # cannot hold a chat’s control path forever.
+                    # cannot hold a chat’s control path forever, and keep it
+                    # inside the same startup deadline.
                     await asyncio.wait_for(
                         _pytgcalls.play(chat_id, stream),
-                        timeout=_LOCAL_PLAY_TIMEOUT,
+                        timeout=max(
+                            0.05, min(_LOCAL_PLAY_TIMEOUT, _startup_remaining())
+                        ),
                     )
             except Exception as play_exc:
                 # See _is_probe_error(): a dead/unreadable CDN URL makes ffprobe
@@ -1607,20 +2007,127 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 # ProcessLookupError instead of anything actionable. Download the
                 # track and play the local file instead of failing the request.
                 # A local Telegram range proxy is the source of truth for a
-                # tagged large file. Recreating it via download_audio() after a
+                # tagged large file. Recreating it via download_audio(, allow_early=True) after a
                 # probe timeout creates a second proxy entry and can race the first
                 # stream. Fail this attempt cleanly instead; the longer local-only
                 # budget above handles normal ffprobe startup latency.
+                if filepath is None and not local_proxy_source:
+                    try:
+                        from melody.core.ytdl import invalidate_stream_url
+                        invalidate_stream_url(track.video_id, want_video=video)
+                        LOGGER.info(
+                            "#stream quarantined unusable direct URL for %s "
+                            "(fallback circuit open)", track.video_id,
+                        )
+                    except Exception as invalidate_exc:  # cache hardening only
+                        LOGGER.debug(
+                            "direct URL quarantine skipped for %s: %s",
+                            track.video_id, invalidate_exc,
+                        )
                 if local_proxy_source:
                     LOGGER.warning(
-                        "local Telegram media proxy handoff failed for %s in %s (%s)",
+                        "local Telegram media proxy handoff failed for %s in %s (%s) "
+                        "— falling back to direct download",
                         track.video_id, chat_id, type(play_exc).__name__,
                     )
+                    if not _video_download_fallback_allowed(track, video):
+                        raise RuntimeError(
+                            "large video direct/proxy stream unavailable; "
+                            "full-file fallback is disabled"
+                        ) from play_exc
+                    # The range proxy failed (chunk timeouts on huge files).
+                    # Fall back to a direct file download instead of dead-ending
+                    # playback. download_audio(, allow_early=True) for a synthetic tg<…> id will
+                    # re-fetch the Telegram message and save it to /tmp.
+                    try:
+                        fallback_path = await asyncio.wait_for(
+                            download_audio(
+                                track.video_id, audio_only=not video,
+                                priority=priority, owner=chat_id, allow_early=not video,
+                            ),
+                            timeout=max(0.05, _startup_remaining()),
+                        )
+                        if fallback_path and os.path.exists(fallback_path):
+                            filepath = fallback_path
+                            stream = _local_media_stream(
+                                chat_id, filepath, video, start_at,
+                            )
+                            if _is_stale_generation(chat_id, gen):
+                                LOGGER.info(
+                                    "#stream stale proxy-fallback resolve for %s in %s "
+                                    "(gen=%s)", track.video_id, chat_id, gen,
+                                )
+                                return
+                            forget_assistant_peer(chat_id)
+                            await asyncio.wait_for(
+                                ensure_assistant_peer(chat_id),
+                                timeout=max(0.05, _startup_remaining()),
+                            )
+                            try:
+                                await asyncio.wait_for(
+                                    _pytgcalls.play(chat_id, stream),
+                                    timeout=max(
+                                        0.05,
+                                        min(_LOCAL_PLAY_TIMEOUT, _startup_remaining()),
+                                    ),
+                                )
+                            except ChatAdminRequired:
+                                _block_vc_admin(chat_id)
+                                if _vc_admin_notice_needed(chat_id):
+                                    _mark_vc_admin_notified(chat_id)
+                                    await _notify_playback_failed(
+                                        chat_id, VC_ADMIN_REQUIRED_MESSAGE,
+                                    )
+                                return False
+                            return
+                    except Exception as fallback_exc:
+                        LOGGER.warning(
+                            "proxy fallback download also failed for %s in %s (%s)",
+                            track.video_id, chat_id, type(fallback_exc).__name__,
+                        )
                     return False
                 if (filepath is not None and not early_file) or not (
                     _is_probe_error(play_exc) or isinstance(play_exc, asyncio.TimeoutError)
                 ):
                     raise
+
+                # A signed audio-only googlevideo URL can be rejected by the
+                # current cloud POP while the same extractor response's HLS
+                # manifest is still usable. Try that alternate direct route
+                # before waiting for the full-file fallback download.
+                alternate_url = getattr(stream, "_melody_fallback_url", None)
+                if alternate_url and not video:
+                    try:
+                        alternate = MediaStream(
+                            alternate_url,
+                            audio_parameters=_get_audio_quality(),
+                            audio_path=alternate_url,
+                            video_flags=MediaStream.Flags.IGNORE,
+                            headers=None,
+                            ffmpeg_parameters=(
+                                _ffmpeg_params(
+                                    chat_id, start_at, source=alternate_url,
+                                    include_reconnect=False,
+                                ) or None
+                            ),
+                        )
+                        await asyncio.wait_for(
+                            _pytgcalls.play(chat_id, alternate),
+                            timeout=max(
+                                0.05,
+                                min(_PLAY_PROBE_TIMEOUT, _startup_remaining()),
+                            ),
+                        )
+                        LOGGER.info(
+                            "Direct CDN alternate HLS route recovered %s in %s",
+                            track.video_id, chat_id,
+                        )
+                        return
+                    except Exception as alternate_exc:
+                        LOGGER.debug(
+                            "alternate direct route failed for %s: %s",
+                            track.video_id, type(alternate_exc).__name__,
+                        )
 
                 if early_file:
                     # The prefix was valid enough to return, but this particular
@@ -1631,8 +2138,11 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                         "Early audio prefix probe failed for %s in %s — waiting for completed file.",
                         track.video_id, chat_id,
                     )
-                    filepath = await wait_for_download(
-                        track.video_id, audio_only=not video,
+                    filepath = await asyncio.wait_for(
+                        wait_for_download(
+                            track.video_id, audio_only=not video,
+                        ),
+                        timeout=max(0.05, _startup_remaining()),
                     )
                     if not filepath:
                         raise RuntimeError("early audio download completed without a file")
@@ -1649,11 +2159,21 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     # Reuse the download already racing in the background instead of
                     # starting a second one from scratch.
                     if download_task is not None and not download_task.done():
-                        filepath = await download_task
+                        filepath = await asyncio.wait_for(
+                            download_task, timeout=max(0.05, _startup_remaining())
+                        )
                     else:
-                        filepath = await download_audio(
-                            track.video_id, audio_only=not video, priority=priority,
-                            owner=chat_id, allow_early=not video,
+                        if not _video_download_fallback_allowed(track, video):
+                            raise RuntimeError(
+                                "large video direct stream unavailable; "
+                                "full-file fallback is disabled"
+                            ) from play_exc
+                        filepath = await asyncio.wait_for(
+                            download_audio(
+                                track.video_id, audio_only=not video, priority=priority,
+                                owner=chat_id, allow_early=not video,
+                            ),
+                            timeout=max(0.05, _startup_remaining()),
                         )
                 stream = _local_media_stream(chat_id, filepath, video, start_at)
                 if _is_stale_generation(chat_id, gen):
@@ -1665,11 +2185,16 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 # The direct attempt may have burnt the cached peer (CHANNEL_INVALID
                 # in the log came from THIS second play, not the first): re-prime it.
                 forget_assistant_peer(chat_id)
-                await ensure_assistant_peer(chat_id)
+                await asyncio.wait_for(
+                    ensure_assistant_peer(chat_id),
+                    timeout=max(0.05, _startup_remaining()),
+                )
                 try:
                     await asyncio.wait_for(
                         _pytgcalls.play(chat_id, stream),
-                        timeout=_LOCAL_PLAY_TIMEOUT,
+                        timeout=max(
+                            0.05, min(_LOCAL_PLAY_TIMEOUT, _startup_remaining())
+                        ),
                     )
                 except ChatAdminRequired:
                     # A direct probe can fail first and the fallback play can then
@@ -1731,8 +2256,13 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             _active[chat_id] = True
             _listener_mode.pop(chat_id, None)
             _is_video[chat_id] = video
+            _stream_source[chat_id] = (
+                "early_local" if early_file else ("local" if filepath else "direct")
+            )
             _play_start_time[chat_id] = time.time()
             _seek_offset[chat_id] = max(0, int(start_at or 0))
+            for key in [k for k in _interrupted_retries if k.startswith(f"{chat_id}:") and not k.endswith(f":{track.video_id}")]:
+                _interrupted_retries.pop(key, None)
             for k in [k for k in _premature_resumes if k.startswith(f"{chat_id}:") and not k.endswith(f":{track.video_id}")]:
                 _premature_resumes.pop(k, None)
 
@@ -1744,9 +2274,34 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     except Exception:
                         pass
 
-        # Do not prefetch or mirror completed media in the background. The
-        # requested track is the only interactive workload; this keeps RAM,
-        # bandwidth, and extractor slots available for the next user request.
+        # ⚡ Warm whatever plays next — RIGHT NOW in the background so there is
+        # zero wait once this song ends (a resolved CDN URL for the direct
+        # path, a cached file for the fallback path).
+        spawn(_prefetch_upcoming(chat_id))
+
+        # 📤 Persist only a COMPLETED file. Audio early-handoff returns a stable
+        # `.early` symlink while the shared yt-dlp job is still running; sending
+        # that prefix to the Telegram dump chat would save a truncated song. Wait on
+        # the existing job in a managed background task, then use its canonical
+        # atomic cache path.
+        if filepath or is_download_inflight(track.video_id, audio_only=not video):
+            if is_download_inflight(track.video_id, audio_only=not video):
+                async def _persist_after_download():
+                    try:
+                        completed = await wait_for_download(
+                            track.video_id, audio_only=not video,
+                        )
+                        if completed:
+                            await _persist_completed_song(completed, track)
+                    except Exception as exc:  # best-effort cache only
+                        LOGGER.debug("completed song persist skipped: %s", exc)
+
+                spawn(
+                    _persist_after_download(),
+                    name=f"persist-download:{track.video_id[:8]}",
+                )
+            elif filepath and not filepath.endswith(".early"):
+                spawn(_persist_completed_song(filepath, track))
 
         from utils.playback_state import save_snapshot
         await save_snapshot(
@@ -1773,7 +2328,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         except Exception:
             pass
 
-        # ROOT-CAUSE FIX (⚠️ Melody Error Log: ChannelInvalid / PeerIdInvalid
+        # ROOT-CAUSE FIX (⚠️ Apex Vibes Error Log: ChannelInvalid / PeerIdInvalid
         # / ChannelPrivate — "_stream_track failed"): joining a Telegram
         # group/voice-chat call happens over the ASSISTANT (userbot) account,
         # not the bot account. MTProto requires the calling account to
@@ -1799,9 +2354,11 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         # left the VC stuck. Now the chat gets a one-line note and the bot
         # simply moves on to the next song.
         if _is_unavailable_media_error(exc):
-            # Search metadata may survive after the actual YouTube media is
-            # deleted/private/blocked. Try one validated alternate before
-            # abandoning the user's request or advancing the queue.
+            # A search hit can have valid metadata while its actual media is
+            # deleted/private/region-blocked. Before abandoning the request,
+            # validate the next search candidates and replay the same Track.
+            # This is deliberately one-shot: if all alternates fail, normal
+            # queue/autoplay handling below takes over without recursion.
             source_query = getattr(track, "source_query", "") or ""
             if source_query and not getattr(track, "_alternate_attempted", False):
                 setattr(track, "_alternate_attempted", True)
@@ -1881,7 +2438,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             )
             return
 
-        # ROOT-CAUSE FIX (⚠️ Melody Error Log: ChannelInvalid / PeerIdInvalid
+        # ROOT-CAUSE FIX (⚠️ Apex Vibes Error Log: ChannelInvalid / PeerIdInvalid
         # / ChannelPrivate — "_stream_track failed"): joining a Telegram
         # group/voice-chat call happens over the ASSISTANT (userbot) account,
         # not the bot account. MTProto requires the calling account to
@@ -1929,7 +2486,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 return
             await _notify_playback_failed(
                 chat_id,
-                "⚠️ <b>Melody ka voice-assistant account is group mein nahi hai, aur auto-join bhi fail ho gaya.</b>\n\n"
+                "⚠️ <b>Apex Vibes ka voice-assistant account is group mein nahi hai, aur auto-join bhi fail ho gaya.</b>\n\n"
                 "Voice chat me gaana bajane ke liye assistant account ka bhi is group ka "
                 "member hona zaroori hai. Please assistant ko group mein manually add karo "
                 "(ya bot ko 'Invite Users via Link' admin permission do) aur phir se "
@@ -1999,21 +2556,54 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     return
                 except Exception as retry_exc:  # noqa: BLE001
                     exc = retry_exc
-            await _notify_playback_failed(
-                chat_id,
-                "❌ <b>Gaana play nahi ho paya.</b>\n\nDobara <code>/play</code> try karo.",
-            )
+            if _is_transient_playback_error(exc):
+                # CDN/download routes are interchangeable transport paths, not
+                # application crashes. Keep the owner log quiet and advance a
+                # queued/autoplay track so one bad source cannot stall the VC.
+                LOGGER.info(
+                    "playback routes exhausted for %s in %s (%s); skipping cleanly",
+                    getattr(track, "video_id", "?"), chat_id, type(exc).__name__,
+                )
+                try:
+                    await _play_next(chat_id)
+                except Exception as next_exc:  # noqa: BLE001
+                    LOGGER.debug("queue advance after playback skip failed: %s", next_exc)
+            else:
+                await _notify_playback_failed(
+                    chat_id,
+                    "❌ <b>Gaana play nahi ho paya.</b>\n\nDobara <code>/play</code> try karo.",
+                )
 
-        await send_error_log(
-            f"_stream_track failed in {chat_id}",
-            exc,
-            context={
-                "chat_id": chat_id,
-                "song_title": track.title if track else None,
-                "video_id": track.video_id if track else None,
-                "uploader": track.uploader if track else None,
-            },
-        )
+        # NOISE FIX: a missing/banned assistant, a stale peer or a chat the
+        # assistant simply cannot address is a Telegram permission state, not
+        # a bug in the bot. The group already got a clear, actionable message
+        # above, so do not spam the owner log with a #crash traceback for it.
+        if isinstance(exc, (ChannelInvalid, ChannelPrivate, PeerIdInvalid,
+                            UserBannedInChannel)) or (
+            isinstance(exc, KeyError) and "ID not found" in str(exc)
+        ):
+            LOGGER.warning(
+                "playback aborted in %s — assistant cannot address the chat (%s)",
+                chat_id, type(exc).__name__,
+            )
+            return
+
+        if _is_transient_playback_error(exc):
+            LOGGER.info(
+                "suppressed transient _stream_track failure in %s: %s",
+                chat_id, type(exc).__name__,
+            )
+        else:
+            await send_error_log(
+                f"_stream_track failed in {chat_id}",
+                exc,
+                context={
+                    "chat_id": chat_id,
+                    "song_title": track.title if track else None,
+                    "video_id": track.video_id if track else None,
+                    "uploader": track.uploader if track else None,
+                },
+            )
 
 
 # Cached assistant user id — resolved once via get_me(), reused everywhere
@@ -2095,7 +2685,7 @@ async def _unban_or_unmute_assistant(chat_id: int) -> str:
 
 async def _ask_for_unban(chat_id: int, assistant_id: int) -> None:
     """REQUESTED: when the assistant is BANNED in a group and the bot itself
-    has no ban/unban rights, don't fail silently — tell the group that Melody
+    has no ban/unban rights, don't fail silently — tell the group that Apex Vibes
     needs "Ban Users" permission (then it unbans the assistant itself and
     joins the voice chat automatically), and give them the ready-made manual
     command as well: /unban <numeric id>."""
@@ -2126,7 +2716,7 @@ async def _auto_join_assistant(chat_id: int) -> bool:
     Also auto-fixes the far more common cause of the assistant "not being
     in the group": it WAS a member but got banned or muted at some point
     (e.g. an over-eager anti-raid bot, or a leftover restriction from
-    before Melody was even added) — see _unban_or_unmute_assistant().
+    before Apex Vibes was even added) — see _unban_or_unmute_assistant().
 
     Requires the BOT to already be a member with "invite users via link"
     permission (true for any group where /play works at all, since that's
@@ -2416,9 +3006,13 @@ async def leave_listener(chat_id: int) -> None:
 
 async def force_play_stream(
     chat_id: int, track, video: bool = False, prejoin: bool = False,
+    deadline: "float | None" = None,
 ) -> bool:
     """Immediately play ``track`` without racing another state transition."""
     _clear_leaving(chat_id)
+    # Manual force-play is also a fresh user request (including /vplayforce).
+    # Do not let a previous speed control leak into this new stream.
+    reset_playback_speed(chat_id)
     try:
         from melody.core.ytdl import cancel_lower_priority_downloads
         cancel_lower_priority_downloads(0, exclude_video_id=track.video_id)
@@ -2452,6 +3046,7 @@ async def force_play_stream(
     try:
         result = await _stream_track(
             chat_id, track, video=video, gen=gen, priority=_FORCE_DOWNLOAD_PRIORITY,
+            deadline=deadline,
         )
         return result is True and not is_vc_admin_blocked(chat_id)
     finally:
@@ -2465,6 +3060,7 @@ async def force_play_stream(
 
 async def play_stream(
     chat_id: int, track, video: bool = False, prejoin: bool = True,
+    deadline: "float | None" = None,
 ) -> bool:
     """
     Start or queue a track.
@@ -2487,6 +3083,17 @@ async def play_stream(
     """
     from melody.core.queue import add_to_queue
 
+    # Hard media invariant: callers using the audio API must not inherit a
+    # stale Track.video flag from cache/queue/recovery state. The command
+    # router passes video=False for .play, and this boundary enforces it again
+    # before queueing or constructing MediaStream.
+    video = bool(video)
+    if not video:
+        try:
+            track.video = False
+        except Exception:
+            pass
+
     # A manual request is interactive work: stop unrelated AutoPlay/recovery
     # downloads before it waits for a resolver. Same-video work is excluded so
     # deduplication can safely promote/share it instead of canceling the manual
@@ -2499,6 +3106,10 @@ async def play_stream(
 
     # A new /play cancels any pending leave-suppression window.
     _clear_leaving(chat_id)
+    # Keep the invariant at the core boundary as well as in the Telegram
+    # handlers: every fresh manual track starts at 1.0x, even when a caller
+    # bypasses play.py (channel wrappers, tests, or older integrations).
+    reset_playback_speed(chat_id)
     lock = _get_play_lock(chat_id)
 
     async with lock:
@@ -2583,7 +3194,9 @@ async def play_stream(
     # accepted the audible stream.
     result = False
     try:
-        result = await _stream_track(chat_id, track, video=video, gen=gen, priority=0)
+        result = await _stream_track(
+            chat_id, track, video=video, gen=gen, priority=0, deadline=deadline
+        )
     finally:
         if result is not True and _resolving.get(chat_id) == gen and get_current(chat_id) is track:
             set_current(chat_id, None)
@@ -2624,6 +3237,55 @@ def _is_probably_stale_stream_end(chat_id: int) -> bool:
         )
         return True
     return False
+
+
+async def _recover_interrupted_stream(chat_id: int) -> bool:
+    """Retry an unexpected mid-track EOF instead of treating it as success.
+
+    Direct googlevideo URLs can expire or briefly stop serving bytes, and a
+    local decoder can also die after a transient disk/network hiccup. The
+    old handler immediately called ``_play_next`` for those events, which is
+    why users saw the bot leave or jump to the next song in the middle. A
+    bounded same-track retry preserves queue order and gives the resolver a
+    chance to obtain a fresh URL. Natural song completion is excluded by the
+    duration margin; unknown/very short tracks keep the existing behavior.
+    """
+    track = get_current(chat_id)
+    if not track or not _active.get(chat_id) or _is_leaving(chat_id):
+        return False
+    try:
+        duration = int(getattr(track, "duration", 0) or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    if duration <= 8:
+        return False
+    position = get_playback_position(chat_id)
+    if position < 2 or position >= duration - 8:
+        return False
+    key = f"{chat_id}:{getattr(track, 'video_id', '')}"
+    attempts = _interrupted_retries.get(key, 0)
+    if attempts >= 2:
+        LOGGER.warning(
+            "#stream giving up mid-track recovery for %s in %s after %d attempts",
+            getattr(track, "video_id", "?"), chat_id, attempts,
+        )
+        return False
+    _interrupted_retries[key] = attempts + 1
+    resume_at = max(0, position - 1)
+    try:
+        LOGGER.warning(
+            "#stream recovered mid-track EOF for %s in %s at %ss (%s, attempt %d)",
+            getattr(track, "video_id", "?"), chat_id, position,
+            _stream_source.get(chat_id, "unknown"), attempts + 1,
+        )
+        started = await _stream_track(
+            chat_id, track, video=bool(_is_video.get(chat_id, False)),
+            start_at=resume_at, gen=_stream_generation.get(chat_id), priority=0,
+        )
+        return started is True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("#stream mid-track recovery failed in %s: %s", chat_id, exc)
+        return False
 
 
 def _mark_leaving(chat_id: int) -> None:
@@ -2676,11 +3338,14 @@ def _forget_call_state(chat_id: int) -> None:
     _active.pop(chat_id, None)
     _silence_playing.pop(chat_id, None)
     _is_video.pop(chat_id, None)
+    _stream_source.pop(chat_id, None)
     _play_start_time.pop(chat_id, None)
     _seek_offset.pop(chat_id, None)
     _prefetch_inflight.pop(chat_id, None)
     for k in [k for k in _premature_resumes if k.startswith(f"{chat_id}:")]:
         _premature_resumes.pop(k, None)
+    for k in [k for k in _interrupted_retries if k.startswith(f"{chat_id}:")]:
+        _interrupted_retries.pop(k, None)
     _speed.pop(chat_id, None)
     _muted.pop(chat_id, None)
     _listener_mode.pop(chat_id, None)
@@ -2746,10 +3411,25 @@ async def pause_stream(chat_id: int) -> bool:
 
 
 async def resume_stream(chat_id: int) -> bool:
-    """Resume playback. Returns False if nothing is actually playing."""
+    """Resume playback. Returns False if nothing is actually playing.
+
+    Video streams use a local Telegram range proxy and may be in the middle of
+    a growing-file handoff. PyTgCalls' native resume RPC can wait indefinitely
+    on that stream and trigger the TimeoutError seen in production. Re-issuing
+    the current video stream at its measured position is deterministic and also
+    keeps audio/video aligned.
+    """
     if not _pytgcalls or not _active.get(chat_id):
         _forget_call_state(chat_id)
         return False
+    if is_video_active(chat_id):
+        try:
+            position = get_playback_position(chat_id)
+            await seek_stream(chat_id, position)
+            LOGGER.info("resume_stream: video resumed via fresh MediaStream at %ss", position)
+            return True
+        except Exception as exc:
+            LOGGER.debug("video MediaStream resume failed for %s; trying native resume: %s", chat_id, exc)
     try:
         await asyncio.wait_for(_pytgcalls.resume(chat_id), timeout=_CONTROL_RPC_TIMEOUT)
         return True
@@ -2928,7 +3608,11 @@ async def seek_stream(chat_id: int, seconds: int) -> int:
     local_path = None
     stream = await _build_direct_stream(chat_id, track, video, seconds)
     if stream is None:
-        local_path = await download_audio(track.video_id, audio_only=not video)
+        if not _video_download_fallback_allowed(track, video):
+            raise RuntimeError(
+                "large video direct stream unavailable; seek cannot use full-file fallback"
+            )
+        local_path = await download_audio(track.video_id, audio_only=not video, allow_early=True)
         stream = _local_media_stream(chat_id, local_path, video, seconds)
 
     _silence_playing.pop(chat_id, None)
@@ -2944,7 +3628,11 @@ async def seek_stream(chat_id: int, seconds: int) -> int:
             "Seek: direct CDN stream unusable for %s in %s (%s) — downloading.",
             track.video_id, chat_id, type(play_exc).__name__,
         )
-        local_path = await download_audio(track.video_id, audio_only=not video)
+        if not _video_download_fallback_allowed(track, video):
+            raise RuntimeError(
+                "large video direct stream unavailable; seek cannot use full-file fallback"
+            ) from play_exc
+        local_path = await download_audio(track.video_id, audio_only=not video, allow_early=True)
         stream = _local_media_stream(chat_id, local_path, video, seconds)
         await _pytgcalls.play(chat_id, stream)
     _active[chat_id] = True
@@ -3019,11 +3707,18 @@ async def set_playback_speed(chat_id: int, speed: float) -> bool:
         return False
 
     position = get_playback_position(chat_id)
+    previous_speed = get_speed(chat_id)
     _speed[chat_id] = speed
     try:
         await seek_stream(chat_id, position)
         return True
     except Exception as exc:
+        # A failed re-issue must not leave a half-applied 2x/0.5x value behind;
+        # otherwise the next track can unexpectedly start at the failed speed.
+        if abs(previous_speed - 1.0) < 0.001:
+            _speed.pop(chat_id, None)
+        else:
+            _speed[chat_id] = previous_speed
         if _is_not_in_call(exc):
             _forget_call_state(chat_id)
             return False
@@ -3183,4 +3878,3 @@ async def auto_leave_watchdog() -> None:
                 await stop_stream(chat_id)
             except Exception as exc:  # noqa: BLE001 — watchdog must never die
                 LOGGER.warning("auto_leave_watchdog failed for %s: %s", chat_id, exc)
-

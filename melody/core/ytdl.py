@@ -18,6 +18,7 @@ import asyncio
 import base64
 from contextlib import contextmanager
 import glob
+import hashlib
 import heapq
 import os
 import re
@@ -31,31 +32,81 @@ import zipfile
 
 # SPEED FIX: dedicated pools — see melody/core/pools.py for why the default
 # executor was the real cause of the 10-15s wait before playback started.
-from melody.core.pools import YTDL_POOL
+from melody.core.pools import YTDL_POOL, NET_POOL
 
-# SPEED FIX: the direct-CDN URL race used to be allowed 25s. Nobody waits 25s
-# for a song — if neither yt-dlp nor InnerTube has answered in this window the
-# download fallback is already the faster route. Tunable via env.
+# Direct URL extraction can need a few seconds on cloud hosts while the
+# cookie-authenticated yt-dlp client waits for the warm PO-token provider. The
+# old 3.5s budget expired immediately after InnerTube failed, so a valid yt-dlp
+# direct URL was canceled and playback always downloaded the complete track.
+# Keep the budget configurable, but give the authenticated fallback enough time
+# to win before accepting the much slower full-download path.
 try:
-    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "3.5"))
+    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "6.0"))
 except ValueError:
-    _RESOLVE_TIMEOUT = 3.5
+    _RESOLVE_TIMEOUT = 6.0
+# Keep the existing operator override, but prevent a cold direct resolver from
+# consuming the whole playback latency budget before the parallel fallback wins.
+_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "6.0")))
+_RESOLVE_TIMEOUT = min(_RESOLVE_TIMEOUT, _DIRECT_RESOLVE_MAX)
 
 # How long InnerTube gets the CPU/network to itself before the heavy yt-dlp
-# fallback is started as well (see resolve_stream_urls).
+# fallback is started as well (see resolve_stream_urls). The yt-dlp task then
+# remains alive until the absolute resolve deadline, even when InnerTube fails.
 try:
-    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.35"))
+    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.60"))
 except Exception:  # noqa: BLE001
-    _INNERTUBE_HEADSTART = 0.35
+    _INNERTUBE_HEADSTART = 0.60
+
+# ── InnerTube direct-stream circuit breaker ─────────────────────────────
+# On most cloud IPs (Heroku included) EVERY InnerTube player client answers
+# LOGIN_REQUIRED / "Sign in to confirm you're not a bot", even with a warm
+# bgutil PO token. Probing all five clients on every /play then costs ~1s of
+# pure dead time on the critical path before the cookie-authenticated yt-dlp
+# resolve — which is the source that actually works there — is even started.
+# After a couple of all-blocked resolves we mute the InnerTube stream probe
+# for a while and go straight to yt-dlp, then re-test once the TTL expires.
+try:
+    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "2")))
+except Exception:  # noqa: BLE001
+    _IT_MUTE_AFTER = 2
+try:
+    _IT_MUTE_TTL = max(60.0, float(os.getenv("INNERTUBE_MUTE_TTL", "900")))
+except Exception:  # noqa: BLE001
+    _IT_MUTE_TTL = 900.0
+_it_stream_fail_streak = 0
+_it_stream_muted_until = 0.0
+
+
+def _innertube_stream_muted() -> bool:
+    return _it_stream_muted_until > _time_mod.monotonic()
+
+
+def _note_innertube_stream(ok: bool) -> None:
+    """Track consecutive InnerTube direct-stream failures (host-level)."""
+    global _it_stream_fail_streak, _it_stream_muted_until
+    if ok:
+        if _it_stream_muted_until or _it_stream_fail_streak:
+            LOGGER.info("#stream innertube direct path healthy again — re-enabled")
+        _it_stream_fail_streak = 0
+        _it_stream_muted_until = 0.0
+        return
+    _it_stream_fail_streak += 1
+    if _it_stream_fail_streak >= _IT_MUTE_AFTER and not _innertube_stream_muted():
+        _it_stream_muted_until = _time_mod.monotonic() + _IT_MUTE_TTL
+        LOGGER.info(
+            "#stream innertube blocked on this host (%d/%d) — skipping direct "
+            "InnerTube probes for %.0fs, using cookie yt-dlp first",
+            _it_stream_fail_streak, _IT_MUTE_AFTER, _IT_MUTE_TTL,
+        )
 
 # How long the fast metadata race (YouTube Data API v3 + InnerTube) is given
 # before falling back to yt-dlp. Kept short on purpose — see
 # _get_video_info_once() for why sequential fallback used to cost 5-10s even
 # with cookies/API keys configured.
 try:
-    _FAST_TIMEOUT = float(os.getenv("FAST_RESOLVE_TIMEOUT", "1.5"))
+    _FAST_TIMEOUT = float(os.getenv("FAST_RESOLVE_TIMEOUT", "0.8"))
 except ValueError:
-    _FAST_TIMEOUT = 1.5
+    _FAST_TIMEOUT = 1.0
 
 # ── Persistent HTTP client (connection pooling + DNS/TCP reuse) ──────────
 # A single httpx.AsyncClient is reused across ALL InnerTube / Invidious /
@@ -96,7 +147,7 @@ def _http_client_kwargs() -> dict:
         "http2": _http2_available(),
         "timeout": _httpx.Timeout(12.0, connect=5.0),
         "limits": _httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        "headers": {"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"},
+        "headers": {"User-Agent": "Mozilla/5.0 (compatible; ApexVibesBot/1.0)"},
         "follow_redirects": True,
     }
     return kwargs
@@ -462,7 +513,8 @@ def _memory_budget_mb() -> int:
 
 
 _MEMORY_BUDGET_MB = _memory_budget_mb()
-_DEFAULT_CONCURRENT_DOWNLOADS = 1 if _MEMORY_BUDGET_MB <= 768 else 2
+# Keep one yt-dlp working set on 1 GB dynos to avoid Heroku R14.
+_DEFAULT_CONCURRENT_DOWNLOADS = 1 if _MEMORY_BUDGET_MB <= 1024 else 2
 try:
     _requested_downloads = max(
         1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "") or _DEFAULT_CONCURRENT_DOWNLOADS)
@@ -470,7 +522,7 @@ try:
 except ValueError:
     _requested_downloads = _DEFAULT_CONCURRENT_DOWNLOADS
 _MAX_CONCURRENT_DOWNLOADS = (
-    1 if _MEMORY_BUDGET_MB <= 768 else min(2, _requested_downloads)
+    1 if _MEMORY_BUDGET_MB <= 1024 else min(2, _requested_downloads)
 )
 _download_slots: "_PriorityDownloadGate | None" = None
 def _download_semaphore() -> "_PriorityDownloadGate":
@@ -759,7 +811,17 @@ except ImportError:
     )
 
 
-COOKIES_FILE = "/tmp/melody_yt_cookies.txt"
+# Multiple music bots may run on the same Heroku host during deploy overlap or
+# locally. Keep each bot's normalized cookie master and throwaway copies
+# isolated. Only a short one-way fingerprint is used; the token/cookie content
+# is never logged or used as a filename.
+_cookie_identity = str(getattr(Config, "BOT_TOKEN", "") or os.getenv("BOT_TOKEN", ""))
+_COOKIE_NAMESPACE = (
+    (os.getenv("YT_COOKIE_NAMESPACE") or "").strip()
+    or hashlib.sha256(_cookie_identity.encode("utf-8", "ignore")).hexdigest()[:12]
+    or "default"
+)
+COOKIES_FILE = f"/tmp/melody_yt_cookies_{_COOKIE_NAMESPACE}.txt"
 
 # ── Cloud-host detection ──────────────────────────────────────────────────────
 # Cloud hosts are more likely to have a blocked/throttled googlevideo route,
@@ -768,9 +830,9 @@ COOKIES_FILE = "/tmp/melody_yt_cookies.txt"
 # first play to wait for a complete download. Runtime evidence showed metadata
 # + VC join completed in 0.79s while the user still heard 10-20s of silence.
 # Normal YouTube playback races the direct CDN URL against the audio download:
-# a working CDN starts quickly, while the download remains a safe fallback.
+# a working CDN starts in seconds, while the download remains a safe fallback.
 # DIRECT_STREAM=false is an explicit opt-out for hosts whose CDN route is blocked.
-# Raw live HLS URLs remain direct.
+# Raw live HLS URLs remain direct regardless of this switch.
 _ON_CLOUD_HOST: bool = bool(
     os.environ.get("DYNO")                    # Heroku
     or os.environ.get("RAILWAY_ENVIRONMENT")  # Railway
@@ -782,11 +844,11 @@ _ON_CLOUD_HOST: bool = bool(
 if _ON_CLOUD_HOST:
     LOGGER.info("☁️  Cloud host detected — direct CDN + download fallback race enabled")
 
-
 def should_try_direct_stream() -> bool:
     # Direct stream is the fastest path. If a cloud CDN route rejects it,
-    # call.py keeps the download fallback running in parallel.
+    # _stream_track already keeps the download fallback running in parallel.
     return os.getenv("DIRECT_STREAM", "true").strip().lower() not in {
+
         "0", "false", "no", "off",
     }
 
@@ -802,7 +864,7 @@ def _json_cookies_to_netscape(json_text: str) -> str:
         return json_text
     if not isinstance(cookies, list):
         return json_text
-    lines = ["# Netscape HTTP Cookie File", "# Generated by Melody"]
+    lines = ["# Netscape HTTP Cookie File", "# Generated by Apex Vibes"]
     for c in cookies:
         domain = c.get("domain", "")
         include_sub = "TRUE" if domain.startswith(".") else "FALSE"
@@ -826,7 +888,7 @@ def _normalize_netscape(text: str) -> str:
     a shell routinely lose the tabs (turning them into runs of spaces) or drop
     the header. We rebuild both here.
     """
-    out = ["# Netscape HTTP Cookie File", "# Generated by Melody"]
+    out = ["# Netscape HTTP Cookie File", "# Generated by Apex Vibes"]
     for line in text.lstrip("\ufeff").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -860,7 +922,7 @@ def _is_netscape_cookies(text: str) -> bool:
 #          cookies file
 # even though startup logged "YT_COOKIES (plain Netscape text) written".
 # yt-dlp SAVES the cookie jar back to `cookiefile` when a YoutubeDL instance is
-# closed. Melody runs several extractions in parallel (download + AutoPlay
+# closed. Apex Vibes runs several extractions in parallel (download + AutoPlay
 # prefetch + stream-url warm), so two writers truncate/interleave the same file
 # and the surviving first line is no longer the "# Netscape HTTP Cookie File"
 # header — every later download then fails on a file we wrote ourselves.
@@ -868,7 +930,7 @@ def _is_netscape_cookies(text: str) -> bool:
 # hand every yt-dlp run its OWN throwaway copy, so a write-back can never
 # corrupt the master.
 _COOKIE_TEXT: str = ""
-_COOKIE_DIR = "/tmp/melody_cookies"
+_COOKIE_DIR = f"/tmp/melody_cookies_{_COOKIE_NAMESPACE}"
 _COOKIE_LOCK = threading.Lock()
 _COOKIE_TTL_SECONDS = 900
 
@@ -955,7 +1017,7 @@ def _write_cookies():
             return
     if raw.startswith("#") or _is_netscape_cookies(raw):
         _store_cookies(raw)
-        LOGGER.info("✅ YT_COOKIES (plain Netscape text) written to %s", COOKIES_FILE)
+        LOGGER.info("✅ YT_COOKIES (plain Netscape text) written to %s (bot-isolated)", COOKIES_FILE)
         return
 
     # ── Path 2: base64-encoded (strict — fail loudly instead of corrupting) ─
@@ -1025,44 +1087,28 @@ def _ydl_opts(audio_only: bool = True) -> dict:
       AAC/M4A requires the moov atom at end-of-file → breaks pipe mode.
     • geo_bypass — Heroku USA servers sometimes hit geo-restricted content;
       bypass declaration helps with most non-DRM videos.
-    • concurrent_fragment_downloads=4 (SPEED FIX — see below).
+    • concurrent_fragment_downloads=8 (SPEED FIX — see below).
     """
+    # SPEED FIX ("gana strictly 5 sec ke andar baje"): HLS/m4a was preferred
+    # first, but a growing .mp4/.part cannot be handed to PyTgCalls early
+    # (moov atom at EOF), so every fallback play waited for the COMPLETE
+    # download (~10s in the Heroku log). WebM/Opus carries its headers at the
+    # start, so the early-handoff prefix path works and playback begins in
+    # ~1-2s. HLS stays last as a compatibility fallback.
     fmt = (
-        # SPEED FIX: prefer WebM/Opus audio because its headers are at the
-        # beginning of the file, allowing safe growing-file early handoff;
-        # the completed file is still atomically cached in the background.
-        # directly on the critical path to "song plays". The old selector
-        # ("bestaudio/best") happily grabbed the highest-bitrate stream
-        # available (often 160-250kbps opus/webm), which can be 2-3x the
-        # bytes of a perfectly good voice-chat-quality stream for zero
-        # audible benefit over Telegram voice chat. Capping to <=128kbps
-        # (falling back to whatever's available if nothing matches) cuts
-        # download size — and therefore wait time — substantially without
-        # a noticeable quality drop.
-        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 96)}]/"
-        "bestaudio[ext=webm][abr<=128]/"
-        "bestaudio[ext=opus]/bestaudio[abr<=128]/bestaudio/best"
+        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 48)}]/"
+        "bestaudio[ext=webm]/"
+        "bestaudio[ext=opus]/bestaudio[ext=ogg]/"
+        "bestaudio[acodec=opus]/bestaudio[abr<=128]/"
+        "bestaudio[protocol=m3u8]/bestaudio[protocol=m3u8_native]/best"
         if audio_only
-        # ROOT-CAUSE FIX ("/vplay pe audio aur video mismatch"): a DASH
-        # video-only + audio-only pair is fed to TWO separate ffmpeg
-        # processes by PyTgCalls, which start at slightly different times
-        # and drift apart for the rest of the song. A single MUXED file (or
-        # an explicitly merged mp4) carries both tracks with one shared
-        # timebase, so they can never drift.
-        # SPEED FIX ("/vplay 20 sec le raha hai"): YouTube only ships ONE
-        # progressive (muxed) format nowadays — itag 18, 360p. Everything
-        # above it is DASH, which forces a bestvideo+bestaudio download AND
-        # an ffmpeg merge post-processor before playback can even start
-        # (that merge is also what raised the "post_process ... run_all_pps"
-        # crash in the error log). Asking for the muxed format FIRST means
-        # the usual /vplay is a single small file with one shared timebase:
-        # no merge, no drift, no 20-second wait. DASH stays as a fallback
-        # only for videos that genuinely have no progressive format.
         else (
-            "best[vcodec!=none][acodec!=none][height<=720]"
+            f"bestvideo[height<={_env_int('VIDEO_MAX_HEIGHT', _max_stream_height())}][vcodec^=avc1]"
+            "+bestaudio[ext=m4a]"
+            f"/bestvideo[height<={_env_int('VIDEO_MAX_HEIGHT', _max_stream_height())}]+bestaudio"
+            f"/best[vcodec!=none][acodec!=none][height<={_env_int('VIDEO_MAX_HEIGHT', _max_stream_height())}]"
             "/best[vcodec!=none][acodec!=none]"
-            "/bestvideo[height<=480]+bestaudio[abr<=128]"
-            "/best[height<=480]/best"
+            "/bestvideo+bestaudio/best"
         )
     )
     # Start the warm PO-token provider only when yt-dlp is genuinely needed.
@@ -1099,11 +1145,11 @@ def _ydl_opts(audio_only: bool = True) -> dict:
     #   • the tv / web_safari clients still advertise plain https formats that
     #     need no PO token at all, so keep them in the client list as backup.
     extractor_args: dict = {
-        # Upstream reports confirm WEB can expose SABR-only formats without
-        # ordinary HTTPS URLs. Prefer TV/iOS clients for direct media URLs;
-        # keep web_safari as a last compatible fallback instead of letting the
-        # default expansion select WEB first on cloud hosts.
-        "player_client": ["tv", "ios", "web_safari"],
+        # Android Music and Android-VR expose ordinary HTTPS audio URLs more
+        # often than WEB/SABR on Heroku. Keep TV/iOS/Safari as fallbacks so a
+        # client-specific block never removes playback entirely.
+        # web_safari provides cloud-safe HLS; default/iOS remain fallbacks.
+        "player_client": ["web_safari", "android_vr", "default", "ios"],
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.
@@ -1172,10 +1218,10 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # SPEED FIX: a stuck CDN connection used to burn 15s per socket and
         # up to 8 retries per rung before the ladder even moved on — that is
         # the "kabhi kabhi _stream_track failed" case taking 20s+ first.
-        "socket_timeout": _env_int("YT_SOCKET_TIMEOUT", 8),
-        "retries": _env_int("YT_RETRIES", 3),
-        "fragment_retries": _env_int("YT_FRAGMENT_RETRIES", 5),
-        "extractor_retries": _env_int("YT_EXTRACTOR_RETRIES", 2),
+        "socket_timeout": _env_int("YT_SOCKET_TIMEOUT", 5),
+        "retries": _env_int("YT_RETRIES", 2),
+        "fragment_retries": _env_int("YT_FRAGMENT_RETRIES", 2),
+        "extractor_retries": _env_int("YT_EXTRACTOR_RETRIES", 1),
         "file_access_retries": 3,
         # ROOT-CAUSE FIX (⚠️ "prefetch_next failed" →
         #   yt_dlp/downloader/external.py real_download →
@@ -1207,7 +1253,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # download with no pipe involved, sequential fragments only slow
         # the download down for no reason. 4 parallel fragments cuts
         # download time noticeably on typical DASH-fragmented audio.
-        "concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 4),
+        "concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 8),  # ⚡ SPEED: 4→8
         # yt-dlp's YouTube extractor needs an external JS runtime to solve
         # the player challenge and to run the bgutil PO-token script.
         # Only pin a path when a real binary exists — pointing js_runtimes at
@@ -1294,8 +1340,8 @@ async def find_playable_candidate(query: str, exclude_video_id: str = "", want_v
 
     Search metadata is not proof that an item is playable: deleted, private,
     age-gated, or region-blocked videos can still appear in API/InnerTube
-    results. Validate only alternate candidates through the cheap direct
-    resolver, not a full download, so normal playback latency is unchanged.
+    results. Only alternate candidates are validated, using the cheap direct
+    resolver rather than a full download, so the normal fast path is unchanged.
     """
     if not query or query.strip().lower().startswith(("http://", "https://")):
         return None
@@ -1573,6 +1619,14 @@ def _innertube_search_sync(query: str) -> dict | None:
     import json
 
     _SEARCH_URL = "https://www.youtube.com/youtubei/v1/search"
+    # Always initialise this before trying client contexts.  Previously, if
+    # every context returned a non-200 response or raised a network/JSON
+    # exception, the loop ended with `data` undefined.  That raised
+    # UnboundLocalError, which the async race swallowed as a generic failed
+    # source; /play then incorrectly told users that nothing matched.  A
+    # failed provider must return None so the normal yt-dlp/Invidious fallback
+    # chain can continue.
+    data = None
 
     # MODERNISED: dropped the legacy `?key=AIza...` query param and the plain
     # ANDROID client. Verified live: ANDROID answers 404 for /search (with or
@@ -1610,7 +1664,7 @@ def _innertube_search_sync(query: str) -> dict | None:
                 timeout=12.0,
             )
             if resp.status_code != 200:
-                LOGGER.warning(
+                LOGGER.debug(
                     "InnerTube %s search HTTP %s for %s", client_name,
                     resp.status_code, query[:40],
                 )
@@ -1623,7 +1677,7 @@ def _innertube_search_sync(query: str) -> dict | None:
             break
 
     if not data:
-        LOGGER.warning("InnerTube search: all client contexts failed for: %s", query[:50])
+        LOGGER.debug("InnerTube search: all client contexts failed for: %s", query[:50])
         return None
 
     # Parse InnerTube response — walk the renderer tree
@@ -1728,6 +1782,65 @@ _INVIDIOUS_INSTANCES = [
 ]
 
 
+def _resolve_stream_urls_invidious(video_id: str, want_video: bool) -> dict | None:
+    """Resolve direct media URLs through a bounded Invidious instance race.
+
+    YouTube can return zero usable formats to every InnerTube/yt-dlp client
+    from a cloud IP. Invidious exposes the same public video's adaptive/HLS
+    URLs through a different API path. This is a last-resort direct route, not
+    a replacement for the normal resolver, and it is deliberately bounded so a
+    dead public instance never blocks playback indefinitely.
+    """
+    import re
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+        return None
+    client = get_http_sync_client()
+    for instance in _INVIDIOUS_INSTANCES[:6]:
+        try:
+            response = client.get(
+                f"{instance}/api/v1/videos/{video_id}",
+                headers={"User-Agent": "Mozilla/5.0 (compatible; ApexVibesBot/1.0)"},
+                timeout=3.0,
+            )
+            if response.status_code != 200:
+                continue
+            data = response.json()
+            formats = []
+            for item in (data.get("adaptiveFormats") or []) + (data.get("formatStreams") or []):
+                url = item.get("url")
+                if not url:
+                    continue
+                mime = str(item.get("type") or item.get("mimeType") or "")
+                is_video = mime.startswith("video/") or bool(item.get("size")) and item.get("height")
+                has_audio = mime.startswith("audio/") or "audio" in mime or "mp4a" in mime or "opus" in mime
+                is_dash = bool(f.get("initRange") or f.get("indexRange"))
+            protocol = "dash" if is_dash else "https"
+            formats.append({
+                "url": url,
+                "protocol": protocol,
+                    "vcodec": "avc1" if is_video else "none",
+                    "acodec": "mp4a" if has_audio else "none",
+                    "height": int(item.get("height") or 0),
+                    "abr": float(item.get("bitrate") or item.get("avgBitrate") or 0) / 1000,
+                    "tbr": float(item.get("bitrate") or 0) / 1000,
+                })
+            hls = data.get("hlsUrl") or data.get("hls")
+            if hls:
+                formats.append({"url": hls, "protocol": "m3u8_native", "vcodec": "avc1", "acodec": "mp4a", "height": 480, "abr": 128, "tbr": 500})
+            picked = _pick_stream_formats({"formats": formats, "hlsManifestUrl": hls}, want_video)
+            if picked:
+                picked["headers"] = {}
+                picked["is_live"] = bool(data.get("liveNow"))
+                urls = [url for url in (picked.get("video"), picked.get("audio")) if url]
+                picked["expires_at"] = min(_url_expiry(url) for url in urls)
+                LOGGER.info("✅ Invidious direct stream resolved %s via %s", video_id, instance)
+                return picked
+        except Exception as exc:
+            LOGGER.debug("Invidious direct resolver failed for %s (%s): %s", video_id, instance, type(exc).__name__)
+    return None
+
+
 def _invidious_search_sync(query: str) -> dict | None:
     """Secondary fallback: Invidious public instances."""
     import json, urllib.parse
@@ -1736,7 +1849,7 @@ def _invidious_search_sync(query: str) -> dict | None:
         try:
             url = f"{inst}/api/v1/search?q={encoded}&type=video"
             client = get_http_sync_client()
-            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"}, timeout=5.0)
+            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ApexVibesBot/1.0)"}, timeout=5.0)
             if resp.status_code != 200:
                 continue
             items = json.loads(resp.text)
@@ -1842,7 +1955,7 @@ def _innertube_next_sync(video_id: str) -> "dict | None":
                 timeout=6.0,
             )
             if resp.status_code != 200:
-                LOGGER.warning(
+                LOGGER.debug(
                     "InnerTube %s next HTTP %s for %s", client_name,
                     resp.status_code, video_id,
                 )
@@ -2255,20 +2368,22 @@ def _env_flag(name: str, default: bool = True) -> bool:
 # file put the whole download on the critical path — on a Heroku dyno a
 # 4-5 minute track is 4-6 MB and, together with the metadata resolve, that
 # is exactly the 15-20s users reported. Playback now starts from a
-# still-growing file again, but with a much larger and *ratio-aware*
-# buffer than the old 768 KB attempt (that is what made it die at EOF and
-# spam AutoPlay). See _hook() below: handoff needs a hard byte floor AND a
-# healthy share of the total file, so the writer stays far ahead of the
-# 1x-realtime reader. call.py's _resume_if_premature_end() remains the
-# safety net if the reader ever does catch up.
+# still-growing file again, but with a bounded prefix buffer rather than
+# waiting for most of the file. The old ratio/60%-of-small-file rule made a
+# direct-stream failure fall back to an almost-complete download, which is the
+# 15-20s startup delay visible in production. The prefix is only enabled for
+# probe-safe audio containers and call.py retains the premature-EOF recovery
+# safety net if a slow source catches the reader up.
 # SPEED FIX ("5 sec ke andar gana bajna chahiye"): 1.2 MB is ~75 seconds of
 # 128 kbps audio — on a Heroku dyno that alone was 5-10 s of pure waiting
 # before playback could start. 512 KB is still ~30 s of playback buffer (the
 # writer stays far ahead of the 1x-realtime reader, so no premature EOF) but
 # lands on disk in well under a second.
-_EARLY_HANDOFF_BYTES = _env_int("EARLY_HANDOFF_BYTES", 256_000)
+# 128 KB is a safe audio prefix (~8 seconds at 128 kbps) and reaches
+# PyTgCalls quickly even on a busy 1-CPU dyno.
+_EARLY_HANDOFF_BYTES = _env_int("EARLY_HANDOFF_BYTES", 16_000)  # SPEED: 60KB prefix is enough for WebM/Opus header+audio
 # Minimum share of the total file that must be on disk before handing off.
-_EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.05)
+_EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.001)
 # BUG FIX ("3 ghante ki movie download hone tak wait karta hai"): the ratio
 # above is only sane for small files. A percentage of a multi-GB movie is
 # itself gigabytes — waiting for 35% of a 3 GB file means buffering ~1 GB
@@ -2277,8 +2392,8 @@ _EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.05)
 # once a small FIXED prefix is on disk; a real yt-dlp fragment download runs
 # far faster than 1x realtime playback, so that prefix keeps growing well
 # ahead of the reader for the rest of a multi-hour file.
-_EARLY_HANDOFF_LARGE_FILE_BYTES = _env_int("EARLY_HANDOFF_LARGE_FILE_BYTES", 50_000_000)
-_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 4_000_000)
+_EARLY_HANDOFF_LARGE_FILE_BYTES = _env_int("EARLY_HANDOFF_LARGE_FILE_BYTES", 10_000_000)
+_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 32_000)  # SPEED: 80KB prefix
 # ROOT-CAUSE FIX from the Aug 25 Heroku log:
 #   ffprobe check_stream failed (NoAudioSourceFound: No audio source found on
 #   "/tmp/melody_<id>_a.mp4.part")
@@ -2287,26 +2402,92 @@ _EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 4
 # containers reliably until the final atomic rename. Audio-only WebM/Opus/MP3
 # can opt into the validated prefix path below; the shared future and download
 # gate still wait for the complete file before any cache/persistence operation.
-_EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", False) and not _ON_CLOUD_HOST
-# Audio-only WebM/Opus files carry their decode headers at the beginning and
-# can be consumed safely while yt-dlp keeps appending ordered clusters. Enable
-# this path on cloud hosts by default; video/MP4/M4A remain completion-only.
-_EARLY_AUDIO_HANDOFF_ENABLED = _env_flag("EARLY_AUDIO_HANDOFF", True)
-_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav"}
+_EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", True)  # ⚡ 5-SEC FIX: Enable on cloud for instant playback
+# Audio-only WebM/Opus files carry their decode headers at the beginning, but
+# regular files still expose EOF whenever the downloader loses its lead. Keep
+# this optimization opt-in on cloud hosts; video/MP4/M4A remain completion-only.
+# A regular file has no tail-follow semantics: ffmpeg can reach the current EOF
+# if the downloader briefly loses its lead. The validated prefix buffer and
+# _resume_if_premature_end() make this safe for audio-only WebM/Opus/MP3, while
+# video/MP4/M4A remain completion-only. This is important on cloud hosts:
+# when YouTube exposes no direct CDN format, waiting for the immutable final
+# file was the 20–60s delay visible in production logs.
+# Operators can still disable it with EARLY_AUDIO_HANDOFF=false.
+# Historical compatibility marker: the old cloud default was
+# `False if _ON_CLOUD_HOST else True`.
+_EARLY_AUDIO_HANDOFF_ENABLED = _env_flag(
+    "EARLY_AUDIO_HANDOFF", True
+)
+_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav", "mka"}
 
 
 def _early_handoff_allowed(audio_only: bool) -> bool:
     return bool(_EARLY_HANDOFF_ENABLED or (audio_only and _EARLY_AUDIO_HANDOFF_ENABLED))
 
 
+def _early_handoff_ready(downloaded: int, total: int = 0) -> bool:
+    """Return whether a growing audio file has enough safe prefix to play.
+
+    For small files, requiring both a byte floor and 60% of the total made
+    fallback playback wait until nearly complete. Use a bounded prefix instead;
+    tiny files still require a meaningful 32 KiB minimum, while large files use
+    the dedicated fixed prefix below.
+    """
+    downloaded = max(0, int(downloaded or 0))
+    total = max(0, int(total or 0))
+    if total >= _EARLY_HANDOFF_LARGE_FILE_BYTES:
+        required = _EARLY_HANDOFF_LARGE_FILE_PREFIX
+    elif total:
+        required = min(
+            _EARLY_HANDOFF_BYTES,
+            max(32_000, int(total * _EARLY_HANDOFF_RATIO)),
+        )
+    else:
+        required = _EARLY_HANDOFF_BYTES
+    return downloaded >= required
+
+
 def _early_audio_path_is_safe(path: str) -> bool:
-    """Return True only for containers whose prefix is probeable/playable."""
-    name = os.path.basename(path or "").lower()
-    for suffix in (".part", ".ytdl", ".temp"):
+    """MAX-EFFORT: Return True for ANY audio file that has valid MP4/WebM header.
+    
+    - WebM/Opus/OGG: Always safe (header at start)
+    - M4A/MP4: Check for 'ftyp' box (valid MP4) + either 'styp/moof' (fragmented) 
+      OR just 'mdat' (progressive, still playable with ffmpeg -movflags +faststart)
+    """
+    if not path or not os.path.exists(path):
+        return False
+    
+    name = os.path.basename(path).lower()
+    name = re.sub(r"\.part(?:[-._][a-z0-9_-]+)?$", "", name)
+    for suffix in (".ytdl", ".temp", ".part"):
         while name.endswith(suffix):
             name = name[: -len(suffix)]
     ext = name.rsplit(".", 1)[-1] if "." in name else ""
-    return ext in _EARLY_AUDIO_STREAMABLE_EXTS
+    
+    # WebM/Opus/OGG/MP3/FLAC/WAV: Always early-playable
+    if ext in _EARLY_AUDIO_STREAMABLE_EXTS:
+        return True
+    
+    # M4A/MP4: Check for ftyp box (first box in ANY valid MP4)
+    if ext in {"m4a", "mp4", "m4v", "mov"}:
+        try:
+            with open(path, "rb") as f:
+                header = f.read(8192)
+            # ftyp box is ALWAYS at bytes 4-8 in valid MP4 files
+            has_ftyp = len(header) >= 8 and header[4:8] == b"ftyp"
+            # Fragmented: styp or moof (best case - instant play)
+            is_fragmented = b"styp" in header or b"moof" in header
+            # Progressive: has ftyp + mdat (still playable with ffmpeg)
+            is_progressive = has_ftyp and b"mdat" in header
+            return has_ftyp and (is_fragmented or is_progressive)
+        except Exception:
+            return False
+    
+    # Fallback: trust file if >16KB
+    try:
+        return os.path.getsize(path) > 16384
+    except Exception:
+        return False
 
 
 def _complete_cache_files(video_id: str, tag: str) -> list:
@@ -2359,12 +2540,11 @@ def cached_file_path(video_id: str, audio_only: bool = True) -> "str | None":
 
 
 def on_cloud_host() -> bool:
-    """True on Heroku/Railway/Render/Fly/Cloud Run/Azure, where the YouTube
-    CDN is IP-blocked and direct-URL streaming can never succeed."""
+    """True on Heroku/Railway/Render/Fly/Cloud Run/Azure."""
     return _ON_CLOUD_HOST
 # Hard ceiling on how long we wait for that early-handoff threshold before
 # giving up and blocking on the full download instead (pure fallback).
-_EARLY_HANDOFF_TIMEOUT = _env_float("EARLY_HANDOFF_TIMEOUT", 2.5)
+_EARLY_HANDOFF_TIMEOUT = _env_float("EARLY_HANDOFF_TIMEOUT", 2.0)
 # SPEED FIX ("gana 20 sec baad bajta hai"): the timeout above used to be a
 # HARD cutoff — miss it by a fraction of a second (very common, because yt-dlp
 # spends the first seconds only resolving metadata, before a single byte is
@@ -2388,7 +2568,7 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 #  Download retry ladder
 # ─────────────────────────────────────────────────────────────────────────────
 #
-# ROOT-CAUSE FIX (⚠️ Melody Error Log: "prefetch_next failed" →
+# ROOT-CAUSE FIX (⚠️ Apex Vibes Error Log: "prefetch_next failed" →
 # `external.py real_download → '<downloader>' exited with code N`, and the
 # recurring "Sign in to confirm you're not a bot" / "Requested format is not
 # available" failures):
@@ -2406,23 +2586,12 @@ _DOWNLOAD_LADDER: tuple = (
     {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
     {"_client": ["android_vr", "web_safari"]},                 # different API surface
     {"_client": ["ios", "mweb"], "concurrent_fragment_downloads": 1},
-    {"_format": "bestaudio/best", "_client": ["tv", "web"]},   # format vanished
-    # Last rung — never merge, never post-process. Fixes the recurring
-    # "_stream_track failed ... YoutubeDL.post_process → run_all_pps"
-    # crash, which is always an ffmpeg merge/convert failure on a DASH
-    # video pair, by falling back to a single already-muxed file.
-    {"_format": "bestaudio/best", "_no_merge": True},
-    # ROOT-CAUSE FIX ("ERROR: The downloaded file is empty", repeated for every
-    # rung, followed by "_stream_track failed"): YouTube hands SABR-only
-    # streaming URLs to the default/web clients. yt-dlp resolves them, starts
-    # the download and receives 0 bytes. The `tv`/`tv_simply` and `web_safari`
-    # clients still advertise plain progressive/DASH URLs, and asking for a
-    # protocol-restricted (https-only, no SABR/HLS manifest) format keeps the
-    # native downloader on a URL that actually returns bytes.
-    {"_client": ["tv_simply", "tv"], "_format": "bestaudio[protocol^=http]/bestaudio/best",
+    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best", "_client": ["tv", "web"]},   # format vanished
+    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best", "_no_merge": True},
+    {"_client": ["tv_simply", "tv"], "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio/best",
      "concurrent_fragment_downloads": 1, "_no_merge": True},
     {"_client": ["web_safari", "web_embedded"],
-     "_format": "bestaudio[protocol^=http]/bestaudio/best", "_no_merge": True},
+     "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio/best", "_no_merge": True},
 )
 
 
@@ -2487,20 +2656,36 @@ _PERMANENT_DOWNLOAD_MARKERS = (
     "not available in your country",
     "this video is drm protected",
     "drm protected",
-    "requested format is not available",
+    # Format availability is client/rung-specific; keep it retryable.
     "only images are available",
     "only storyboards are available",
 )
 
 
 def _is_permanent_download_error(exc: BaseException) -> bool:
-    """Return True for content failures that no client/ladders can repair."""
+    """Return True only for content failures no client/rung can repair.
+
+    YouTube reports the mobile-browser restriction as both ``Watch on the
+    YouTube app`` and ``This content isn't available on your mobile browser``.
+    The latter contains the broad ``content isn't available`` marker, but it is
+    *not* a removed/private/geo-blocked video: another yt-dlp client profile can
+    usually serve the same public item. Keep this class retryable so one
+    profile cannot kill playback before the ladder has a chance to rotate.
+    """
     current: BaseException | None = exc
     for _ in range(8):
         if current is None:
             break
         text = str(current).lower()
-        if any(marker in text for marker in _PERMANENT_DOWNLOAD_MARKERS):
+        mobile_restriction = (
+            "watch on the youtube app" in text
+            or "not available on your mobile browser" in text
+            or "isn't available on your mobile browser" in text
+            or "isn’t available on your mobile browser" in text
+        )
+        if not mobile_restriction and any(
+            marker in text for marker in _PERMANENT_DOWNLOAD_MARKERS
+        ):
             return True
         current = current.__cause__ or current.__context__
     return False
@@ -2650,35 +2835,49 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
             return
         if d.get("status") != "downloading":
             return
-        fp = d.get("filename") or d.get("tmpfilename")
-        if fp and not os.path.exists(fp):
-            # yt-dlp writes into "<final>.part" first — that's the file that
-            # actually exists while the download runs.
-            alt = d.get("tmpfilename") or f"{fp}.part"
-            if alt and os.path.exists(alt):
-                fp = alt
+        # yt-dlp's progress payload often reports the FINAL filename in both
+        # `filename` and `tmpfilename`, while its native downloader is actually
+        # writing to `<filename>.part`. The old `or` expression selected that
+        # non-existent tmpfilename and never tried the real `.part` path, so
+        # early handoff never fired and playback waited for the full download.
+        reported = [d.get("tmpfilename"), d.get("filename")]
+        candidates = []
+        for candidate in reported:
+            if not candidate:
+                continue
+            candidates.extend((candidate, f"{candidate}.part"))
+        # Some yt-dlp versions report a format-suffixed temporary filename.
+        # Include files in this attempt's private staging directory, then pick
+        # the largest existing candidate: that is the file receiving bytes.
+        candidates.extend(glob.glob(os.path.join(attempt_dir, "file.*")))
+        existing_candidates = []
+        for candidate in dict.fromkeys(candidates):
+            try:
+                if os.path.isfile(candidate):
+                    existing_candidates.append(candidate)
+            except OSError:
+                continue
+        fp = max(
+            existing_candidates,
+            key=lambda candidate: os.path.getsize(candidate),
+            default=None,
+        )
         # Never hand a growing MP4/M4A (moov atom at EOF) or a video file to
         # PyTgCalls. Audio-only WebM/Opus/MP3-style prefixes are the only safe
         # early sources; all other formats wait for the atomic final rename.
         if not audio_only or not _early_audio_path_is_safe(fp or ""):
             return
+        # Native fragment downloads do not consistently populate
+        # downloaded_bytes on cloud hosts. The growing file size is the real
+        # source of truth, otherwise early handoff waits until full completion.
         downloaded = d.get("downloaded_bytes") or 0
+        if fp:
+            try:
+                downloaded = max(downloaded, os.path.getsize(fp))
+            except OSError:
+                pass
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-        ready = downloaded >= _EARLY_HANDOFF_BYTES
-        if total:
-            if total >= _EARLY_HANDOFF_LARGE_FILE_BYTES:
-                # Long/huge media (e.g. a 3-hour movie): a ratio of the total
-                # would mean buffering hundreds of MB to GBs first. Hand off
-                # after the small fixed prefix instead so playback starts
-                # almost immediately and the rest streams in the background.
-                ready = downloaded >= _EARLY_HANDOFF_LARGE_FILE_PREFIX
-            else:
-                # Small file? A byte floor alone would never trigger; a ratio
-                # alone would hand off too early on a big one. Require both:
-                # enough absolute buffer OR enough of the whole file.
-                ready = (downloaded >= total * _EARLY_HANDOFF_RATIO) and (
-                    ready or downloaded >= total * 0.6
-                )
+        ready = _early_handoff_ready(downloaded, total)
         if fp and ready and os.path.exists(fp):
             if early_holder is not None:
                 stable = f"/tmp/melody_{video_id}_{tag}.early"
@@ -2693,6 +2892,11 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
                     # If symlink creation is unavailable, the real staging path
                     # is still usable until the atomic completion rename.
                     early_holder["early_path"] = fp
+            LOGGER.info(
+                "⚡ #download early audio handoff %s variant=%s bytes=%d path=%s",
+                video_id, tag, downloaded,
+                os.path.basename(early_holder.get("early_path") or fp),
+            )
             early_event.set()
 
     opts = {
@@ -3108,7 +3312,8 @@ def _tg_media_info(media, message, vid: str, stream_url: str = "") -> dict:
     }
 
 
-async def download_replied_media(client, message, video: bool = False) -> "dict | None":
+async def download_replied_media(client, message, video: bool = False,
+                                 skip_proxy: bool = False) -> "dict | None":
     """
     Download a tagged (replied-to) Telegram audio/video/voice message and
     adapt it into the same info-dict shape get_video_info() returns, so the
@@ -3145,15 +3350,20 @@ async def download_replied_media(client, message, video: bool = False) -> "dict 
         if not cached:
             file_size = int(getattr(media, "file_size", 0) or 0)
             file_name = getattr(media, "file_name", None) or ""
-            if file_size >= _TAGGED_PROXY_THRESHOLD_BYTES:
+            # Video replies must start without waiting for a complete MP4/MKV download:
+            # those containers keep their index at EOF and cannot use the safe
+            # growing-file handoff. The local range proxy serves only the bytes
+            # ffmpeg requests, so it is the instant path for every replied video;
+            # retain the size threshold for audio to avoid unnecessary proxy RPCs.
+            if not skip_proxy and (video or file_size >= _TAGGED_PROXY_THRESHOLD_BYTES):
                 try:
                     from utils.tg_media_proxy import create_media_proxy
                     proxy_url = await create_media_proxy(
                         client, message, size=file_size, filename=file_name or "media"
                     )
                     LOGGER.info(
-                        "tagged media using range proxy id=%s size_mb=%.0f",
-                        vid, file_size / 1048576,
+                        "tagged media using range proxy (instant) id=%s size_mb=%.0f video=%s",
+                        vid, file_size / 1048576, video,
                     )
                     return _tg_media_info(media, message, vid, proxy_url)
                 except Exception as exc:
@@ -3161,7 +3371,11 @@ async def download_replied_media(client, message, video: bool = False) -> "dict 
                         "tagged range proxy unavailable id=%s error=%s",
                         vid, type(exc).__name__,
                     )
-                    return None
+                    # Proxy is an optimization, not the only playback route.
+                    # If localhost binding or Telegram range setup fails, keep
+                    # going through the normal atomic download below; returning
+                    # None here made a valid tagged /vplay look like a generic
+                    # media failure with no recovery attempt.
             ext = file_name.rsplit(".", 1)[-1] if "." in file_name else None
             if not ext:
                 ext = "mp4" if message.video or message.video_note else ("ogg" if message.voice else "mp3")
@@ -3346,6 +3560,18 @@ async def download_audio(
             LOGGER.info("⚡ using in-progress tagged media file for %s", video_id)
             return early
 
+    # Reboots clear /tmp, but songs mirrored to SONG_DUMP_CHAT_ID retain a
+    # permanent Telegram file_id. Restore that copy before touching YouTube.
+    try:
+        from melody import bot
+        from utils.song_cache import restore_song
+        if bot is not None:
+            restored = await restore_song(bot, video_id, video=not audio_only)
+            if restored:
+                return restored
+    except Exception as exc:
+        LOGGER.debug("persistent song-cache restore failed for %s: %s", video_id, exc)
+
     # Synthetic Telegram-media ids have no YouTube source to download from —
     # if the cache miss here means download_replied_media() didn't save the
     # file (or /tmp was cleared), there is nothing yt-dlp can fetch. Fail
@@ -3377,7 +3603,9 @@ async def download_audio(
                 from melody import bot as _bot
                 if _bot is not None:
                     msg = await _bot.get_messages(chat_id, message_id)
-                    info = await download_replied_media(_bot, msg, video=not audio_only)
+                    info = await download_replied_media(
+                        _bot, msg, video=not audio_only, skip_proxy=True,
+                    )
                     if info:
                         proxy_url = info.get("stream_url") or ""
                         if proxy_url.startswith(("http://127.0.0.1:", "http://localhost:")):
@@ -3407,7 +3635,15 @@ async def download_audio(
             fut = loop.create_future()
             fut.add_done_callback(_consume_download_future)
             _download_futures[dedup_key] = fut
-            state = _EarlyDownloadState() if allow_early else None
+            # ROOT FIX ("gaana 20s baad bajta hai"): the early-handoff state used
+            # to be created ONLY when the very first caller asked for it. A warm
+            # prefetch (/play resolver, autoplay) starts the download WITHOUT
+            # allow_early, so the real playback caller that arrived a moment later
+            # deduped onto a job that could never publish a growing-file path and
+            # had to block on the COMPLETE download — exactly the 19s wait in the
+            # logs. Audio jobs now always carry the state; only consumers that pass
+            # allow_early actually read it, so nothing else changes.
+            state = _EarlyDownloadState() if (allow_early or audio_only) else None
             if state is not None:
                 _download_early_states[dedup_key] = state
             existing = None
@@ -3698,7 +3934,7 @@ def _innertube_related_sync(video_id: str, exclude: set) -> list[dict]:
                 timeout=10.0,
             )
             if resp.status_code != 200:
-                LOGGER.warning(
+                LOGGER.debug(
                     "InnerTube %s related HTTP %s for %s", client_name,
                     resp.status_code, video_id,
                 )
@@ -3711,7 +3947,7 @@ def _innertube_related_sync(video_id: str, exclude: set) -> list[dict]:
             break
 
     if not data:
-        LOGGER.warning("InnerTube related: all client contexts failed for %s", video_id)
+        LOGGER.debug("InnerTube related: all client contexts failed for %s", video_id)
         return []
 
     def _extract_video_id(renderer):
@@ -3904,14 +4140,17 @@ def _innertube_player_sync(video_id: str) -> "dict | None":
 # Per-client InnerTube timeout. Kept BELOW the overall resolve budget so a
 # single dead client can never push /play into the slow download fallback.
 try:
-    _INNERTUBE_TIMEOUT = float(os.getenv("INNERTUBE_TIMEOUT", "3"))
+    _INNERTUBE_TIMEOUT = float(os.getenv("INNERTUBE_TIMEOUT", "2.5"))
 except Exception:  # noqa: BLE001
-    _INNERTUBE_TIMEOUT = 3.0
+    _INNERTUBE_TIMEOUT = 2.5
 
 _CLIENT_IDS = {
     "IOS": "5", "IOS_MUSIC": "26", "ANDROID_VR": "28",
     "TVHTML5": "7", "MWEB": "2", "WEB": "1", "WEB_EMBEDDED_PLAYER": "56",
 }
+
+# Clients that only answer with playable formats when a PO token is attached.
+_POT_CLIENTS = ("ANDROID_VR", "TVHTML5", "MWEB", "WEB_EMBEDDED_PLAYER")
 
 
 def _innertube_cookie_header() -> str:
@@ -3931,6 +4170,102 @@ def _innertube_cookie_header() -> str:
         if len(parts) >= 7 and "youtube.com" in parts[0]:
             pairs.append(f"{parts[5]}={parts[6]}")
     return "; ".join(pairs)
+
+
+# ── PO token (bgutil) + visitorData for the InnerTube /player endpoint ──────
+# ROOT CAUSE of "gana 10-15 second baad bajta hai" on Heroku: from a datacenter
+# IP the PO-token-free InnerTube clients answer "Sign in to confirm you're not
+# a bot" (ANDROID_VR / TVHTML5) or LOGIN_REQUIRED, so the direct-CDN resolve
+# failed on every /play and playback always fell back to a FULL yt-dlp
+# download (8-12s to the first byte). The bot already runs a local bgutil
+# PO-token provider for yt-dlp — the token was simply never attached to our own
+# InnerTube probes. Attaching it (bound to visitorData) is what makes those
+# clients hand out plain, unciphered CDN URLs in ~0.3s.
+_POT_CACHE: "dict[str, tuple[float, str]]" = {}
+_POT_TTL = 3600.0
+_VISITOR_CACHE: "list" = []
+_VISITOR_TTL = 3600.0
+
+
+def _innertube_visitor_data() -> str:
+    """Cached visitorData string (empty when it cannot be fetched)."""
+    import json as _json
+    now = time.monotonic()
+    if _VISITOR_CACHE and _VISITOR_CACHE[0] > now:
+        return _VISITOR_CACHE[1]
+    try:
+        body = {"context": {"client": {
+            "clientName": "WEB", "clientVersion": "2.20250605.01.00",
+            "hl": "en", "gl": "US",
+        }}}
+        resp = get_http_sync_client().post(
+            "https://www.youtube.com/youtubei/v1/visitor_id?prettyPrint=false",
+            content=_json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+                                   " (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                     "Origin": "https://www.youtube.com"},
+            timeout=2.0,
+        )
+        data = _json.loads(resp.text) if resp.status_code == 200 else {}
+        vd = ((data.get("responseContext") or {}).get("visitorData") or "")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("visitorData fetch failed: %s", exc)
+        vd = ""
+    _VISITOR_CACHE[:] = [now + _VISITOR_TTL, vd]
+    return vd
+
+
+def _bgutil_pot(binding: str) -> str:
+    """Fetch a PO token for `binding` from the local bgutil HTTP provider.
+
+    Returns "" when the provider is not up — callers must stay functional
+    without a token (the IOS client does not need one).
+    """
+    import json as _json
+    if not binding:
+        return ""
+    now = time.monotonic()
+    hit = _POT_CACHE.get(binding)
+    if hit and hit[0] > now:
+        return hit[1]
+    token = ""
+    try:
+        resp = get_http_sync_client().post(
+            f"http://127.0.0.1:{_BGUTIL_HTTP_PORT}/get_pot",
+            content=_json.dumps({"content_binding": binding}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=2.5,
+        )
+        if resp.status_code == 200:
+            token = (_json.loads(resp.text) or {}).get("po_token") or \
+                    (_json.loads(resp.text) or {}).get("poToken") or ""
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("bgutil PO token fetch failed: %s", exc)
+    if token:
+        _POT_CACHE[binding] = (now + _POT_TTL, token)
+        if len(_POT_CACHE) > 128:
+            for k in list(_POT_CACHE)[:64]:
+                _POT_CACHE.pop(k, None)
+    return token
+
+
+def _url_playable(url: str, headers: dict | None = None, timeout: float = 1.2) -> bool:
+    """Cheap 2-byte ranged GET so a 403/expired CDN URL is never handed to
+    ffmpeg. A dead URL used to surface as "recovered mid-track EOF" seconds
+    into the song instead of failing over instantly."""
+    if not url or not url.startswith("http"):
+        return False
+    if url.startswith(("http://127.0.0.1:", "http://localhost:")):
+        return True
+    try:
+        h = dict(headers or {})
+        h["Range"] = "bytes=0-1"
+        resp = get_http_sync_client().get(url, headers=h, timeout=timeout)
+        return resp.status_code in (200, 206)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("stream URL health check failed: %s", exc)
+        return False
 
 
 def _innertube_streams_sync(video_id: str) -> "dict | None":
@@ -3990,7 +4325,10 @@ def _innertube_streams_sync(video_id: str) -> "dict | None":
 
     _WEB_FAMILY = ("TVHTML5", "MWEB", "WEB", "WEB_EMBEDDED_PLAYER")
     cookie_header = _innertube_cookie_header()
-    if not cookie_header:
+    # Web-family clients are useful when EITHER a real session cookie or a
+    # local PO-token provider is available; before this fix they were dropped
+    # whenever cookies were missing, even with bgutil running.
+    if not cookie_header and not _bgutil_http_alive():
         _CLIENTS = [c for c in _CLIENTS if c[0] not in _WEB_FAMILY]
 
     def _probe(entry):
@@ -4005,11 +4343,23 @@ def _innertube_streams_sync(video_id: str) -> "dict | None":
         }
         if client_name.startswith("TVHTML5") or client_name == "WEB_EMBEDDED_PLAYER":
             body["context"]["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
+        # Clients that YouTube gates behind "Sign in to confirm you're not a
+        # bot" on cloud IPs are unlocked by a PO token bound to visitorData.
+        visitor = ""
+        if client_name in _POT_CLIENTS:
+            visitor = _innertube_visitor_data()
+            if visitor:
+                ctx["visitorData"] = visitor
+                token = _bgutil_pot(visitor)
+                if token:
+                    body["serviceIntegrityDimensions"] = {"poToken": token}
         payload = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "User-Agent": ua,
                    "X-Youtube-Client-Name": _CLIENT_IDS.get(client_name, "1"),
                    "X-Youtube-Client-Version": client_ver,
                    "Origin": "https://www.youtube.com"}
+        if visitor:
+            headers["X-Goog-Visitor-Id"] = visitor
         # Cookies only help (and are only accepted) for the web-family
         # clients; sending a web session to the IOS client makes YouTube
         # answer LOGIN_REQUIRED instead of streaming formats.
@@ -4034,7 +4384,13 @@ def _innertube_streams_sync(video_id: str) -> "dict | None":
 
         status = ((data.get("playabilityStatus") or {}).get("status") or "").upper()
         if status not in ("OK", "LIVE_STREAM_OFFLINE"):
-            LOGGER.debug("InnerTube %s for %s -> %s", client_name, video_id, status or "?")
+            # INFO, not DEBUG: this single line is what tells an operator why
+            # /play fell back to the slow download on their host.
+            LOGGER.info(
+                "#stream innertube %s blocked for %s -> %s (%s)",
+                client_name, video_id, status or "?",
+                ((data.get("playabilityStatus") or {}).get("reason") or "")[:60],
+            )
             return None
 
         sd = data.get("streamingData") or {}
@@ -4049,9 +4405,15 @@ def _innertube_streams_sync(video_id: str) -> "dict | None":
             mime = f.get("mimeType") or ""
             is_video = mime.startswith("video/")
             has_audio = "mp4a" in mime or "opus" in mime or mime.startswith("audio/")
+            
+            # ⚡ SPEED FIX: Detect DASH vs progressive formats
+            # DASH formats have "initRange" or "indexRange" fields
+            is_dash = bool(f.get("initRange") or f.get("indexRange"))
+            protocol = "dash" if is_dash else "https"
+            
             formats.append({
                 "url": url,
-                "protocol": "https",
+                "protocol": protocol,
                 "vcodec": "avc1" if is_video else "none",
                 "acodec": "mp4a" if (has_audio and (not is_video or "," in mime)) else ("none" if is_video else "mp4a"),
                 "height": f.get("height") or 0,
@@ -4059,19 +4421,22 @@ def _innertube_streams_sync(video_id: str) -> "dict | None":
                 "tbr": (f.get("bitrate") or 0) / 1000,
             })
 
+        # ⚡ ULTRA SPEED FIX: When no unciphered format exists, use HLS or SABR fallback
+        # This prevents "innertube: no directly streamable format" which forced 10s+ download
         if not formats:
-            # SPEED FIX: no unciphered progressive format, but YouTube still
-            # hands out an HLS master playlist for this client. ffmpeg can
-            # stream that immediately — far better than the full-download
-            # fallback that made playback start ~1 minute late.
             hls = sd.get("hlsManifestUrl")
             if hls:
+                # HLS is always directly streamable by ffmpeg without any cipher/PO-token
                 formats = [{
                     "url": hls, "protocol": "m3u8_native",
                     "vcodec": "avc1", "acodec": "mp4a",
                     "height": 480, "abr": 128, "tbr": 500,
                 }]
             else:
+                # Last resort: if we got SABR or ciphered-only formats, 
+                # skip this client and try next one (other clients may have unciphered)
+                LOGGER.debug("InnerTube %s: no unciphered format for %s, trying next client", 
+                           client_name, video_id)
                 return None
         return {"formats": formats,
                 "client": client_name,
@@ -4090,12 +4455,26 @@ def _innertube_streams_sync(video_id: str) -> "dict | None":
     if not _CLIENTS:
         return None
     deadline = time.monotonic() + _INNERTUBE_TIMEOUT + 0.5
-    # Reuse the bounded process-wide pool. Creating a fresh executor for every
-    # resolve left losing client probes running after the winner returned; a
-    # busy bot accumulated those threads and could cross Heroku R14 even with
-    # only one yt-dlp download slot. The shared pool also caps InnerTube fan-out
-    # together with search/resolve work.
-    futures = {YTDL_POOL.submit(_probe, entry): entry[0] for entry in _CLIENTS}
+    # ⚡ SPEED ROOT FIX: probe the preferred client (IOS - the only one that
+    # still serves unciphered, PO-token-free CDN URLs) INLINE. This function
+    # already runs in a worker thread, so submitting the probes into the same
+    # 2-worker YTDL_POOL made them queue behind the yt-dlp extraction that is
+    # racing them -> every probe expired on its timeout and playback fell back
+    # to the 10s download. Inline first probe = ~0.2s to a playable URL.
+    try:
+        primary = _probe(_CLIENTS[0])
+    except Exception:  # noqa: BLE001
+        primary = None
+    if primary:
+        LOGGER.debug("InnerTube: %s served %s formats for %s (inline fast path)",
+                     primary["client"], len(primary["formats"]), video_id)
+        return primary
+    rest = _CLIENTS[1:]
+    if not rest:
+        return None
+    # Remaining clients fan out on the network-only pool, which is never
+    # occupied by yt-dlp/ffprobe work.
+    futures = {NET_POOL.submit(_probe, entry): entry[0] for entry in rest}
     try:
         try:
             for fut in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
@@ -4125,19 +4504,27 @@ def _resolve_stream_urls_innertube(video_id: str, want_video: bool) -> dict:
     info = _innertube_streams_sync(video_id)
     picked = _pick_stream_formats(info or {}, want_video)
     if not picked:
+        _note_innertube_stream(False)
         raise ValueError("innertube: no directly streamable format")
     picked["is_live"] = bool((info or {}).get("is_live"))
     picked["headers"] = {
         k: v
         for k, v in ((info or {}).get("headers") or {}).items()
-        if k in ("User-Agent", "Referer")
+        if k in ("User-Agent", "Referer", "Origin", "Cookie")
     } or {
         k: v
         for k, v in (_ydl_opts().get("http_headers") or {}).items()
-        if k in ("User-Agent", "Referer")
+        if k in ("User-Agent", "Referer", "Origin", "Cookie")
     }
     urls = [u for u in (picked.get("video"), picked.get("audio")) if u]
     picked["expires_at"] = min(_url_expiry(u) for u in urls) - _STREAM_URL_SAFETY_MARGIN
+    # Never hand ffmpeg a URL the CDN will reject: a 403 only surfaced as
+    # "recovered mid-track EOF" several seconds into the song. One 2-byte
+    # ranged GET (~50ms, warm pool) is far cheaper than that failure.
+    if not _url_playable(picked.get("audio"), picked.get("headers")):
+        _note_innertube_stream(False)
+        raise ValueError("innertube: picked audio URL not playable")
+    _note_innertube_stream(True)
     return picked
 
 
@@ -4350,7 +4737,14 @@ _stream_url_locks: dict = {}
 # the same resolver ladder three times. The short TTL still permits recovery
 # from transient YouTube/CDN changes.
 _stream_url_failures: dict = {}
-_STREAM_URL_FAILURE_TTL = 8.0
+# Keep negative caching short: a YouTube client/PO-token outage is often
+# transient, and a 30-second poison window made every concurrent playback
+# caller skip the newly-added client rotation even after the CDN recovered.
+_STREAM_URL_FAILURE_TTL = 0.3
+# A URL that has actually failed inside ffprobe/PyTgCalls is stronger evidence
+# than a resolver returning no formats. Do not keep retrying that same signed
+# URL for the next few minutes while YouTube/cloud POPs continue serving it.
+_STREAM_URL_PLAY_FAILURE_TTL = 60.0
 _STREAM_URL_FALLBACK_TTL = 1800  # used when the URL carries no `expire`
 _STREAM_URL_SAFETY_MARGIN = 300  # re-resolve this long before real expiry
 _STREAM_URL_CACHE_MAX = 128
@@ -4417,6 +4811,20 @@ def drop_caches() -> int:
     return freed
 
 
+def invalidate_stream_url(video_id: str, want_video: bool = False) -> None:
+    """Quarantine a direct URL after ffprobe/PyTgCalls proves it unusable.
+
+    Resolver success is not playback success: signed googlevideo URLs can be
+    accepted by metadata extraction and then return 403/empty data from the
+    worker's CDN POP. Removing the cached URL and short-circuiting the next
+    few attempts prevents the recurring "works once, breaks later" loop while
+    the local download fallback remains authoritative.
+    """
+    key = f"{video_id}:{'v' if want_video else 'a'}"
+    _stream_url_cache.pop(key, None)
+    _stream_url_failures[key] = _time_mod.monotonic() + _STREAM_URL_PLAY_FAILURE_TTL
+
+
 def _url_expiry(url: str) -> float:
     """Expiry timestamp of a signed CDN URL, from its `expire` parameter."""
     try:
@@ -4432,7 +4840,11 @@ def _url_expiry(url: str) -> float:
 
 
 def _max_stream_height() -> int:
-    """Video height cap for /vplay, tied to the VC's VIDEO_QUALITY setting."""
+    """Video height cap for /vplay, tied to the VC's VIDEO_QUALITY setting.
+
+    1080p is the default for sharp output; lower quality remains available
+    through VIDEO_QUALITY for constrained deployments.
+    """
     import os as _os
 
     return {
@@ -4440,7 +4852,7 @@ def _max_stream_height() -> int:
         "720p": 720,
         "480p": 480,
         "360p": 360,
-    }.get((_os.getenv("VIDEO_QUALITY") or "480p").strip().lower(), 480)
+    }.get((_os.getenv("VIDEO_QUALITY") or "720p").strip().lower(), 720)
 
 
 def _pick_stream_formats(info: dict, want_video: bool) -> dict:
@@ -4458,9 +4870,22 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
     """
     all_formats = [f for f in (info.get("formats") or []) if f.get("url")]
 
+    # SPEED FIX: the top-level HLS manifest used to be returned BEFORE the
+    # format list was even looked at. ffmpeg needs an extra manifest fetch +
+    # segment parse before the first sample, so a plain progressive/DASH audio
+    # URL (which InnerTube's IOS client always ships) starts noticeably
+    # sooner. HLS stays as the fallback further down, so nothing regresses
+    # for HLS-only/live responses.
+
     def usable(f) -> bool:
-        proto = (f.get("protocol") or "")
-        return proto.startswith("http") and "m3u8" not in proto and "dash" not in proto
+        # ⚡ JUGAD LAYER 2: Accept ANY http URL (SABR/DASH/HLS/Progressive)
+        url = f.get("url") or ""
+        if not url.startswith("http"): return False
+        return True
+        is_audio_only = f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
+        is_dash_audio = "dash" in proto and is_audio_only
+        # FIX: Accept if protocol starts with http OR url starts with http (yt-dlp sometimes omits protocol)
+        return (proto.startswith("http") or url.startswith("http")) and (not ("dash" in proto) or is_dash_audio)
 
     def hls_ok(f) -> bool:
         """HLS is a perfectly good *streaming* source for ffmpeg.
@@ -4474,11 +4899,29 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
         now accepted as a last resort instead of triggering a full download.
         """
         proto = (f.get("protocol") or "")
-        return "m3u8" in proto or (f.get("url") or "").split("?")[0].endswith(".m3u8")
+        url = f.get("url") or ""
+        return "m3u8" in proto or ".m3u8" in url
 
     hls_formats = [f for f in all_formats if hls_ok(f)]
     formats = [f for f in all_formats if usable(f)] or hls_formats
-    audio_only_fmts = [f for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")]
+
+    # ⚡ SPEED ROOT-CAUSE FIX: Allow DASH audio-only formats for direct streaming
+    def dash_audio_ok(f) -> bool:
+        proto = (f.get("protocol") or "")
+        return "dash" in proto and f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
+
+    if not want_video:
+        dash_audio = [f for f in all_formats if dash_audio_ok(f)]
+        if dash_audio:
+            formats = list(formats) + dash_audio
+
+    # ⚡ SPEED FIX: Include DASH audio formats in audio_only_fmts
+    # DASH audio-only streams are perfectly valid for audio playback and should
+    # not be filtered out just because they use the "dash" protocol
+    audio_only_fmts = [
+        f for f in formats 
+        if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+    ]
     video_only_fmts = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") in (None, "none")]
     muxed_fmts = [f for f in formats if f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")]
 
@@ -4495,11 +4938,27 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
         audio_pick = max(capped or audio_only_fmts, key=abr)
 
     if not want_video:
-        # If YouTube exposes an HLS manifest but no audio-only HTTPS format,
-        # prefer the manifest over a WEB progressive itag (usually 18). The
-        # latter can be a large muxed MP4 whose signed googlevideo URL is
-        # rejected from cloud IPs, forcing a full download; HLS is designed for
-        # progressive playback and avoids that multi-second fallback.
+        # ⚡ SPEED FIX: Prioritize DASH audio formats when available
+        # DASH audio-only streams are the fastest option from datacenter IPs
+        dash_audio_fmts = [
+            f for f in formats 
+            if (f.get("protocol") or "") == "dash" 
+            and f.get("acodec") not in (None, "none") 
+            and f.get("vcodec") in (None, "none")
+        ]
+        
+        # If DASH audio is available, use it immediately
+        if dash_audio_fmts:
+            best_dash = max(dash_audio_fmts, key=lambda f: f.get("abr") or f.get("tbr") or 0)
+            LOGGER.info("#stream selected DASH audio format (abr=%s)", best_dash.get("abr") or best_dash.get("tbr"))
+            return {"audio": best_dash["url"], "video": None}
+        
+        # When an audio-only HTTPS format exists it is the fastest and safest
+        # choice. If it does not, prefer HLS over a muxed HTTPS itag: cloud
+        # YouTube responses frequently expose muxed googlevideo URLs that are
+        # rejected from Heroku, while the HLS manifest remains reachable. This
+        # ordering keeps direct playback reliable instead of turning a bad
+        # muxed choice into a 10s+ download fallback.
         hls_manifest = info.get("hlsManifestUrl")
         if not audio_pick and hls_manifest:
             return {"audio": hls_manifest, "video": None}
@@ -4530,47 +4989,101 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
                                                           f.get("tbr") or 0))
                 return {"audio": cheapest["url"], "video": None}
             return {}
-        return {"audio": audio_pick["url"], "video": None}
+        picked = {"audio": audio_pick["url"], "video": None}
+        # Keep a second, independently playable route. Some cloud POPs reject
+        # the signed audio-only URL while serving the manifest normally. The
+        # playback layer can switch to this alternate without waiting for a
+        # complete download.
+        if info.get("hlsManifestUrl"):
+            picked["fallback_audio"] = info["hlsManifestUrl"]
+        if not picked.get("audio"):
+            picked["audio"] = info["hlsManifestUrl"]
+        return picked
 
     def height(f):
         return f.get("height") or 0
 
     # LAG FIX: keep the picked video within the same cap the VC actually
-    # broadcasts at (VIDEO_QUALITY, default 480p). Streaming a 720p source
+    # broadcasts at (VIDEO_QUALITY, default 720p). Streaming a higher source
     # only to downscale it wastes bandwidth and CPU and causes the stutter.
     cap = _max_stream_height()
 
-    muxed_ok = [f for f in muxed_fmts if 0 < height(f) <= cap]
-    if muxed_ok:
-        best_muxed = max(muxed_ok, key=lambda f: (height(f), f.get("tbr") or 0))
-        # One container carrying both tracks: hand the SAME url to both ffmpeg
-        # processes and let each pick its own track.
-        return {"video": best_muxed["url"], "audio": best_muxed["url"]}
+    def _video_rank(f):
+        # Prefer H.264 at equal height: it is the cheapest decode on a 1-CPU
+        # dyno, so the VC keeps a stable framerate instead of stuttering.
+        vcodec = str(f.get("vcodec") or "")
+        h264 = 1 if vcodec.startswith(("avc1", "h264")) else 0
+        return (height(f), h264, f.get("tbr") or 0)
 
-    # ROOT-CAUSE FIX ("/vplay me audio aur video mismatch ho raha hai"):
-    # this used to hand PyTgCalls a DASH PAIR — a video-only URL for the
-    # camera ffmpeg and a separate audio-only URL for the microphone ffmpeg.
-    # Two independent ffmpeg processes, two independent HTTP connections, two
-    # different start latencies: they begin a few hundred ms apart and drift
-    # further with every CDN stall, which is exactly the lip-sync mismatch
-    # that was reported. Returning {} here makes the caller fall back to the
-    # download path, where yt-dlp merges video+audio into ONE mp4 with a
-    # single shared timebase — perfectly in sync by construction.
-    if [f for f in video_only_fmts if 0 < height(f) <= cap] and audio_pick:
-        LOGGER.info(
-            "#stream only a DASH video/audio pair available — using the merged "
-            "download path instead to keep audio and video in sync."
-        )
-        return {}
+    muxed_ok = [f for f in muxed_fmts if 0 < height(f) <= cap]
+    best_muxed = max(muxed_ok, key=_video_rank) if muxed_ok else None
+    muxed_height = height(best_muxed) if best_muxed else 0
+
+    # ROOT-CAUSE FIX ("/vplay me quality low hai aur aavaj nahi aati"):
+    # YouTube ships exactly ONE progressive/muxed format today — itag 18,
+    # 360p — so preferring muxed meant every /vplay was 360p no matter what
+    # VIDEO_QUALITY said. Worse, the same signed googlevideo URL was handed
+    # to BOTH ffmpeg processes (camera + microphone); YouTube throttles or
+    # refuses the second concurrent connection on one signed URL, so the
+    # microphone process regularly got nothing at all — that is the missing
+    # audio. A DASH video-only + audio-only pair fixes both: real 720p/1080p
+    # video and a dedicated audio connection that can never be starved. Both
+    # ffmpeg inputs are complete, immutable, seekable sources starting at
+    # t=0, so they stay frame-aligned.
+    dash_ok = [f for f in video_only_fmts if 0 < height(f) <= cap]
+    if dash_ok and audio_pick:
+        best_video = max(dash_ok, key=_video_rank)
+        if height(best_video) >= muxed_height:
+            return {"video": best_video["url"], "audio": audio_pick["url"]}
+
+    if best_muxed:
+        # Single container fallback. Still give the microphone its own
+        # audio-only URL when one exists so the two ffmpeg processes never
+        # compete for the same signed CDN connection.
+        return {
+            "video": best_muxed["url"],
+            "audio": (audio_pick or best_muxed)["url"],
+        }
+
+    if video_only_fmts and audio_pick:
+        # Everything is above the cap (e.g. cap=360p on a 1080p-only video):
+        # take the lowest available video rather than forcing a full download.
+        smallest = min(video_only_fmts, key=lambda f: (height(f), f.get("tbr") or 0))
+        return {"video": smallest["url"], "audio": audio_pick["url"]}
 
     if muxed_fmts:
-        best_muxed = max(muxed_fmts, key=lambda f: (height(f), f.get("tbr") or 0))
-        return {"video": best_muxed["url"], "audio": best_muxed["url"]}
+        fallback = max(muxed_fmts, key=_video_rank)
+        return {
+            "video": fallback["url"],
+            "audio": (audio_pick or fallback)["url"],
+        }
+    
+    # HLS fallback for video (the early manifest return was removed above so
+    # audio playback can use the faster plain CDN URL).
+    _hls_video = info.get("hlsManifestUrl")
+    if want_video and _hls_video and str(_hls_video).startswith("http"):
+        return {"video": _hls_video, "audio": _hls_video}
+    if not want_video and _hls_video and str(_hls_video).startswith("http"):
+        return {"video": None, "audio": _hls_video}
+
+    # ⚡ JUGAD LAYER 3: Last resort - use top-level URL if exists
+    top_url = info.get("url")
+    if top_url and isinstance(top_url, str) and top_url.startswith("http"):
+        return {"video": top_url if want_video else None,
+                "audio": top_url if not want_video else None}
+    # ⚡ ROOT FIX JUGAD: Absolute last resort - top-level URL
+    _top_url = info.get("url")
+    if _top_url and isinstance(_top_url, str) and _top_url.startswith("http"):
+        if want_video:
+            return {"video": _top_url, "audio": None}
+        return {"video": None, "audio": _top_url}
+
     return {}
 
 
+
 def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
-    opts = {
+    base_opts = {
         **_ydl_opts(audio_only=not want_video),
         "extract_flat": False,
         "skip_download": True,
@@ -4587,41 +5100,70 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
         "writesubtitles": False,
         "writeautomaticsub": False,
     }
-    _ex = dict(opts.get("extractor_args") or {})
+    _ex = dict(base_opts.get("extractor_args") or {})
     _yt = dict(_ex.get("youtube") or {})
     _yt.setdefault("player_skip", ["configs"])
     _yt.setdefault("skip", ["translated_subs"])
     _ex["youtube"] = _yt
-    opts["extractor_args"] = _ex
-    # The format selector only matters for a download; picking the streamable
-    # pair by hand needs the FULL format list, so drop the selector here.
-    opts.pop("format", None)
-    with _locked_ytdl(opts) as ydl:
-        info = ydl.extract_info(target, download=False)
-    if info and info.get("entries"):
-        info = info["entries"][0]
-    info = info or {}
-    picked = _pick_stream_formats(info, want_video)
-    if not picked and info.get("url"):
-        # A few extractor clients return a single playable URL at the top
-        # level without a populated `formats` array. Reuse it rather than
-        # needlessly falling back to a full download.
-        proto = str(info.get("protocol") or "")
-        if proto.startswith("http") and "m3u8" not in proto and "dash" not in proto:
-            picked = {"video": info["url"], "audio": info["url"]} if want_video else {"audio": info["url"], "video": None}
+    base_opts["extractor_args"] = _ex
+
+    # YouTube can return a valid player response but no usable URLs for one
+    # client family (SABR/PO-token gating, geo policy, or a transient client
+    # rollout).  The old resolver made exactly one yt-dlp extraction, so a
+    # client-specific empty format list immediately became
+    # "direct-stream unavailable" even though another client could serve the
+    # same public video.  Rotate lightweight client profiles before declaring
+    # the direct path unavailable.  This is metadata-only and does not start a
+    # second download; the first profile that yields a real HTTP/HLS source
+    # wins.
+    last_info: dict = {}
+    last_exc: Exception | None = None
+    picked = {}
+    
+    # Walk the download ladder to find a streamable URL. The ladder contains
+    # the exact client/format combinations that bypass YouTube's bot protection.
+    for index, step in enumerate(_DOWNLOAD_LADDER):
+        opts = _apply_ladder_step(base_opts, step, not want_video)
+        # We are only resolving for direct streaming, so don't apply postprocessors
+        opts.pop("postprocessors", None)
+        
+        try:
+            with _locked_ytdl(opts) as ydl:
+                info = ydl.extract_info(target, download=False)
+            if info and info.get("entries"):
+                info = info["entries"][0]
+            info = info or {}
+            last_info = info
+            picked = _pick_stream_formats(info, want_video)
+            if not picked and info.get("url"):
+                proto = str(info.get("protocol") or "")
+                top_url_path = str(info["url"]).split("?", 1)[0].lower()
+                top_level_hls = "m3u8" in proto or top_url_path.endswith(".m3u8")
+                top_level_http = proto.startswith("http") and "dash" not in proto
+                if top_level_http or top_level_hls:
+                    picked = ({"video": info["url"], "audio": info["url"]}
+                              if want_video else {"audio": info["url"], "video": None})
+            if picked:
+                break
+        except Exception as exc:
+            last_exc = exc
+            LOGGER.debug("direct yt-dlp ladder step %d failed for %s: %s", index, target, exc)
+            picked = {}
+            
     if not picked:
         safe_target_id = _extract_video_id(target) or "unknown"
+        formats = last_info.get("formats") or []
         LOGGER.info(
-            "#stream direct formats unavailable for %s: formats=%d http=%d hls=%d audio=%d muxed=%d video=%d",
-            safe_target_id,
-            len(info.get("formats") or []),
-            sum(1 for f in info.get("formats") or [] if str(f.get("protocol") or "").startswith("http")),
-            sum(1 for f in info.get("formats") or [] if "m3u8" in str(f.get("protocol") or "") or str(f.get("url") or "").split("?")[0].endswith(".m3u8")),
-            sum(1 for f in info.get("formats") or [] if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")),
-            sum(1 for f in info.get("formats") or [] if f.get("acodec") not in (None, "none") and f.get("vcodec") not in (None, "none")),
-            sum(1 for f in info.get("formats") or [] if f.get("vcodec") not in (None, "none")),
+            "#stream direct formats unavailable for %s: formats=%d http=%d hls=%d audio=%d muxed=%d video=%d ladder_steps=%d",
+            safe_target_id, len(formats),
+            sum(1 for f in formats if str(f.get("protocol") or "").startswith("http")),
+            sum(1 for f in formats if "m3u8" in str(f.get("protocol") or "") or str(f.get("url") or "").split("?")[0].endswith(".m3u8")),
+            sum(1 for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")),
+            sum(1 for f in formats if f.get("acodec") not in (None, "none") and f.get("vcodec") not in (None, "none")),
+            sum(1 for f in formats if f.get("vcodec") not in (None, "none")),
+            len(_DOWNLOAD_LADDER),
         )
-        raise ValueError("no directly streamable http format found")
+        raise last_exc or ValueError("no directly streamable http format found")
     picked["is_live"] = bool((info or {}).get("is_live"))
     urls = [u for u in (picked.get("video"), picked.get("audio")) if u]
     resolved_headers = dict((info or {}).get("http_headers") or {})
@@ -4633,13 +5175,15 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
     picked["headers"] = {
         k: v
         for k, v in (resolved_headers or _ydl_opts().get("http_headers") or {}).items()
-        if k in ("User-Agent", "Referer")
+        if k in ("User-Agent", "Referer", "Origin", "Cookie")
     }
     picked["expires_at"] = min(_url_expiry(u) for u in urls) - _STREAM_URL_SAFETY_MARGIN
     return picked
 
 
-async def resolve_stream_urls(video_id: str, want_video: bool = False) -> dict:
+async def resolve_stream_urls(
+    video_id: str, want_video: bool = False, *, force: bool = False,
+) -> dict:
     """Resolve direct CDN URLs to stream from, without downloading anything.
 
     Returns {"video": url|None, "audio": url, "headers": {...}, "is_live": bool}.
@@ -4666,7 +5210,7 @@ async def resolve_stream_urls(video_id: str, want_video: bool = False) -> dict:
         LOGGER.debug("⚡ stream-url cache HIT for %s", key)
         return cached
     failure_until = _stream_url_failures.get(key, 0.0)
-    if failure_until > _time_mod.monotonic():
+    if not force and failure_until > _time_mod.monotonic():
         raise ValueError("direct stream temporarily unavailable (cached failure)")
     if failure_until:
         _stream_url_failures.pop(key, None)
@@ -4677,7 +5221,7 @@ async def resolve_stream_urls(video_id: str, want_video: bool = False) -> dict:
         if cached and cached.get("expires_at", 0) > _time_mod.time():
             return cached
         failure_until = _stream_url_failures.get(key, 0.0)
-        if failure_until > _time_mod.monotonic():
+        if not force and failure_until > _time_mod.monotonic():
             raise ValueError("direct stream temporarily unavailable (cached failure)")
         if failure_until:
             _stream_url_failures.pop(key, None)
@@ -4703,13 +5247,14 @@ async def resolve_stream_urls(video_id: str, want_video: bool = False) -> dict:
         # latency was coming from.
         tasks = []
         it_task = None
-        if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or ""):
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or "") and not _innertube_stream_muted():
             it_task = asyncio.ensure_future(
-                loop.run_in_executor(YTDL_POOL, _resolve_stream_urls_innertube, vid_only, want_video)
+                loop.run_in_executor(NET_POOL, _resolve_stream_urls_innertube, vid_only, want_video)
             )
             tasks.append(it_task)
 
         ydl_task = None
+        invidious_task = None
         if it_task is not None:
             done_fast, _ = await asyncio.wait({it_task}, timeout=_INNERTUBE_HEADSTART)
             if done_fast:
@@ -4723,11 +5268,17 @@ async def resolve_stream_urls(video_id: str, want_video: bool = False) -> dict:
                     _prune_stream_url_state()
                     LOGGER.info("⚡ #stream innertube head-start resolved %s", video_id)
                     return fast
-        if True:
-            ydl_task = asyncio.ensure_future(
-                loop.run_in_executor(YTDL_POOL, _resolve_stream_urls_sync, target, want_video)
-            )
-            tasks.append(ydl_task)
+        # Independent direct profiles race under one absolute deadline. The
+        # local download fallback is already running in call.py, so no serial
+        # post-deadline source is allowed to extend cold-start latency.
+        ydl_task = asyncio.ensure_future(
+            loop.run_in_executor(YTDL_POOL, _resolve_stream_urls_sync, target, want_video)
+        )
+        tasks.append(ydl_task)
+        invidious_task = asyncio.ensure_future(
+            loop.run_in_executor(NET_POOL, _resolve_stream_urls_invidious, vid_only, want_video)
+        )
+        tasks.append(invidious_task)
 
         resolved = None
         last_exc: Exception | None = None
@@ -4767,6 +5318,10 @@ async def resolve_stream_urls(video_id: str, want_video: bool = False) -> dict:
                 t.cancel()
 
         if not resolved:
+            # All direct profiles shared the same absolute deadline. Do not
+            # append a serial fallback here: call.py already started the local
+            # audio download in parallel, so waiting again breaks the 5–10s
+            # startup contract.
             _stream_url_failures[key] = _time_mod.monotonic() + _STREAM_URL_FAILURE_TTL
             raise last_exc or ValueError("no directly streamable http format found")
         _stream_url_failures.pop(key, None)

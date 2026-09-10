@@ -134,7 +134,7 @@ async def _pick_related_track(chat_id: int) -> "Track | None":
     get_related_videos() already returns id, title, duration, url, thumbnail
     and uploader, so the Track is built directly from that data.
     """
-    from melody.core.queue import get_current, get_last_user_track
+    from melody.core.queue import get_current, get_last_user_track, get_last_user_mode
 
     history = await get_history(chat_id)
     exclude_ids = [h["id"] for h in history] if history else []
@@ -277,12 +277,14 @@ async def _pick_related_track(chat_id: int) -> "Track | None":
         requester_id=0,
         requester_name="AutoPlay",
         requested_in=chat_id,
+        # AutoPlay must continue the mode of the last human request. Without
+        # this, a /vplay session creates a default audio Track and the next
+        # automatic song silently switches back to /play (variant=a).
+        video=get_last_user_mode(chat_id),
     )
 
 
 async def prefetch_next(chat_id: int) -> "Track | None":
-    if _os.environ.get("AUTOPLAY_PREDOWNLOAD", "false").strip().lower() not in {"1", "true", "yes", "on"}:
-        return None
     """
     Predict + pre-download the next AutoPlay track for `chat_id`.
 
@@ -365,13 +367,16 @@ async def _prefetch_next_locked(chat_id: int) -> "Track | None":
     # let a prefetch occupy that slot and turn the next manual request into a
     # 30-70 second wait. The next autoplay request will still resolve and
     # download the track on demand.
-    if on_cloud_host() and not _cloud_prefetch_enabled():
-        # Small dynos keep the prediction but skip the full pre-download so an
-        # interactive /play always owns the only safe yt-dlp slot.
+    if on_cloud_host() and not _cloud_prefetch_enabled() and want_video:
+        # Small dynos keep the prediction but skip only full video pre-download:
+        # video consumes much more bandwidth/disk and can contend with /play.
+        # Audio prefetch is intentionally allowed because it is the latency-
+        # critical next-track path and is canceled automatically if a manual
+        # request arrives (priority 50 < interactive priority 0).
         remember_played(chat_id, track.video_id)
         set_predownloaded(chat_id, track)
         LOGGER.info(
-            "AutoPlay: cloud pre-download skipped for %s to protect interactive playback",
+            "AutoPlay: cloud video pre-download skipped for %s to protect interactive playback",
             track.video_id,
         )
         return track
@@ -399,6 +404,10 @@ async def _prefetch_next_locked(chat_id: int) -> "Track | None":
             track.video_id, audio_only=not want_video, priority=50, owner=chat_id,
         )
         if path:
+            # This function itself runs in a managed background task, so the
+            # completed cache upload cannot delay the currently playing track.
+            from melody.core.call import _persist_completed_song
+            await _persist_completed_song(path, track)
             LOGGER.info("AutoPlay: pre-downloaded %s → instant next play", track.video_id)
     except Exception as exc:
         LOGGER.info("AutoPlay: pre-download failed for %s (%s)", track.video_id, exc)
@@ -563,7 +572,7 @@ async def try_autoplay(chat_id: int) -> bool:
                 await bot.send_message(
                     chat_id,
                     f"<blockquote>🎶 <b>AutoPlay ▶️</b> <code>{safe_title}</code>\n"
-                    f"<i>Melody ne sunwaya!</i>\n"
+                    f"<i>Apex Vibes ne sunwaya!</i>\n"
                     f"🙋 Requested by: <i>AutoPlay</i></blockquote>",
                     parse_mode=enums.ParseMode.HTML,
                 )

@@ -5,8 +5,10 @@ FIX: format_queue() now returns HTML (not Markdown) so queue_cmd.py can
      send it with parse_mode=HTML and avoid ENTITY_BOUNDS_INVALID when song
      titles contain Markdown special characters (* _ ` [ etc.).
 """
+import asyncio
 import html
 import random
+import weakref
 from dataclasses import dataclass, fields
 from typing import Optional
 from utils.database import get_setting, set_setting
@@ -36,8 +38,8 @@ class Track:
     # Storing the intent on the Track itself makes it survive being queued,
     # popped, looped, or replayed by AutoPlay.
     video: bool = False
-    # Preserve the original text query so an unavailable top search hit can
-    # be replaced with the next streamable candidate during playback.
+    # Original text query, retained so a failed top YouTube hit can be replaced
+    # with the next streamable candidate without losing the user's intent.
     source_query: str = ""
 
 
@@ -47,14 +49,27 @@ _current: dict[int, Track] = {}
 _loop: dict[int, str] = {}       # "none" | "single" | "all"
 _volume: dict[int, int] = {}     # 0-200 (0 = muted)
 _predownloaded: dict[int, Track] = {}  # chat_id -> next AutoPlay track, already cached to /tmp
+_persist_locks = weakref.WeakValueDictionary()
+
+
+async def _save_snapshot_ordered(lock, chat_id, current, queue, loop, volume):
+    async with lock:
+        from utils.playback_state import save_snapshot
+        await save_snapshot(chat_id, current, queue, loop, volume)
 
 
 def _persist(chat_id: int) -> None:
     """Persist mutations without putting Mongo latency on playback's hot path."""
     try:
-        from utils.playback_state import save_snapshot
-        spawn(save_snapshot(
-            chat_id, _current.get(chat_id), _queues.get(chat_id, []),
+        lock = _persist_locks.get(chat_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _persist_locks[chat_id] = lock
+        # Copy the queue at submission time. The per-chat lock preserves
+        # mutation order, preventing an older async write from landing after a
+        # later /clear or /skip and resurrecting stale playback state.
+        spawn(_save_snapshot_ordered(
+            lock, chat_id, _current.get(chat_id), list(_queues.get(chat_id, [])),
             _loop.get(chat_id, "none"), _volume.get(chat_id, 100),
         ))
     except RuntimeError:
@@ -85,13 +100,24 @@ def restore_snapshot(snapshot: dict) -> None:
     chat_id = int(snapshot["chat_id"])
     current = snapshot.get("current")
     queue = snapshot.get("queue") or []
+    # A restore can run more than once during reconnect/recovery. Remove old
+    # state first; otherwise a snapshot with no current track resurrects the
+    # previous track and a malformed volume value can abort the whole restore.
+    _current.pop(chat_id, None)
     if current:
         restored = _track_from_dict(current)
         if restored is not None:
             _current[chat_id] = restored
     _queues[chat_id] = [t for t in (_track_from_dict(i) for i in queue) if t]
-    _loop[chat_id] = snapshot.get("loop", "none")
-    _volume[chat_id] = max(0, min(200, int(snapshot.get("volume", 100))))
+    mode = snapshot.get("loop", "none")
+    _loop[chat_id] = mode if isinstance(mode, str) and mode in {
+        "none", "single", "all"
+    } else "none"
+    try:
+        volume = int(snapshot.get("volume", 100))
+    except (TypeError, ValueError):
+        volume = 100
+    _volume[chat_id] = max(0, min(200, volume))
 
 
 def get_queue(chat_id: int) -> list[Track]:
@@ -161,6 +187,10 @@ def active_video_ids() -> set[str]:
 def clear_queue(chat_id: int, persist: bool = True):
     _queues[chat_id] = []
     _current.pop(chat_id, None)
+    # A predownloaded AutoPlay track belongs to the old queue/session. Keeping
+    # it here made /stop or /clear followed by a new /play unexpectedly start
+    # stale audio, and also kept its media protected from cache eviction.
+    _predownloaded.pop(chat_id, None)
     if persist:
         _persist(chat_id)
 
