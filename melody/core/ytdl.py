@@ -40,27 +40,27 @@ try:
     # Keep direct resolution bounded because the local download races it. An
     # 8s resolver plus the Invidious rescue used to delay playback even when
     # the fallback file was already progressing.
-    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "4.0"))
+    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "6.0"))
 except ValueError:
-    _RESOLVE_TIMEOUT = 4.0
+    _RESOLVE_TIMEOUT = 6.0
 _DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "4.0")))
 _RESOLVE_TIMEOUT = min(_RESOLVE_TIMEOUT, _DIRECT_RESOLVE_MAX)
 
 # How long InnerTube gets the CPU/network to itself before the heavy yt-dlp
 # fallback is started as well (see resolve_stream_urls).
 try:
-    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.20"))
+    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.60"))
 except Exception:  # noqa: BLE001
-    _INNERTUBE_HEADSTART = 0.20
+    _INNERTUBE_HEADSTART = 0.60
 
 # Heroku/cloud IPs can return no usable InnerTube stream for every player
 # client. Repeating that dead fan-out on every /play adds several seconds before
 # the cookie-authenticated yt-dlp path even gets a chance. Mute the host-level
 # InnerTube stream probe after consecutive failures and periodically re-test.
 try:
-    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "1")))
+    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "2")))
 except Exception:  # noqa: BLE001
-    _IT_MUTE_AFTER = 1
+    _IT_MUTE_AFTER = 2
 try:
     _IT_MUTE_TTL = max(60.0, float(os.getenv("INNERTUBE_MUTE_TTL", "900")))
 except Exception:  # noqa: BLE001
@@ -101,9 +101,9 @@ def _note_innertube_stream(ok: bool) -> None:
 # _get_video_info_once() for why sequential fallback used to cost 5-10s even
 # with cookies/API keys configured.
 try:
-    _FAST_TIMEOUT = float(os.getenv("FAST_RESOLVE_TIMEOUT", "1.5"))
+    _FAST_TIMEOUT = float(os.getenv("FAST_RESOLVE_TIMEOUT", "1.0"))
 except ValueError:
-    _FAST_TIMEOUT = 1.5
+    _FAST_TIMEOUT = 1.0
 
 # ── Persistent HTTP client (connection pooling + DNS/TCP reuse) ──────────
 # A single httpx.AsyncClient is reused across ALL InnerTube / Invidious /
@@ -1126,9 +1126,17 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # Prefer high-quality stereo audio. The configurable ceiling avoids
         # pulling an unnecessarily huge source on a small cloud worker while
         # still allowing 160kbps/192kbps sources when YouTube exposes them.
-        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 160)}]/"
-        "bestaudio[ext=webm][abr<=192]/"
-        "bestaudio[ext=opus]/bestaudio[abr<=192]/bestaudio/best"
+        # SPEED FIX (Sep 10 Heroku log: download 8.97s, stream 10.71s):
+        # a 160-192kbps source is 3-4x the bytes needed for a 48kHz voice
+        # chat, and HLS/m4a cannot be handed off early (moov atom at EOF).
+        # WebM/Opus carries its headers at the START, so the growing .part
+        # file is playable within ~1s.
+        f"bestaudio[ext=webm][abr<={_env_int('YT_AUDIO_MAX_ABR', 72)}]/"
+        "bestaudio[ext=webm][abr<=96]/"
+        "bestaudio[ext=webm]/"
+        "bestaudio[ext=opus]/bestaudio[ext=ogg]/"
+        "bestaudio[acodec=opus]/bestaudio[abr<=128]/"
+        "bestaudio[protocol=m3u8]/bestaudio[protocol=m3u8_native]/best"
 
         if audio_only
         # ROOT-CAUSE FIX ("/vplay pe audio aur video mismatch"): a DASH
@@ -1191,7 +1199,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # web_safari is the reliable cloud escape hatch: yt-dlp documents
         # that its HLS formats do not need a GVS PO token. Keep default/iOS
         # behind it for ordinary HTTPS formats and compatibility fallback.
-        "player_client": ["web_safari", "default", "ios"],
+        "player_client": ["web_safari", "android_vr", "default", "ios"],
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.
@@ -1260,7 +1268,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # SPEED FIX: a stuck CDN connection used to burn 15s per socket and
         # up to 8 retries per rung before the ladder even moved on — that is
         # the "kabhi kabhi _stream_track failed" case taking 20s+ first.
-        "socket_timeout": _env_int("YT_SOCKET_TIMEOUT", 8),
+        "socket_timeout": _env_int("YT_SOCKET_TIMEOUT", 5),
         "retries": _env_int("YT_RETRIES", 1),
         "fragment_retries": _env_int("YT_FRAGMENT_RETRIES", 5),
         "extractor_retries": _env_int("YT_EXTRACTOR_RETRIES", 1),
@@ -1295,7 +1303,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # download with no pipe involved, sequential fragments only slow
         # the download down for no reason. 4 parallel fragments cuts
         # download time noticeably on typical DASH-fragmented audio.
-        "concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 4),
+        "concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 8),  # SPEED: 4->8
         # yt-dlp's YouTube extractor needs an external JS runtime to solve
         # the player challenge and to run the bgutil PO-token script.
         # Only pin a path when a real binary exists — pointing js_runtimes at
@@ -2407,9 +2415,9 @@ def _env_flag(name: str, default: bool = True) -> bool:
 # before playback could start. 512 KB is still ~30 s of playback buffer (the
 # writer stays far ahead of the 1x-realtime reader, so no premature EOF) but
 # lands on disk in well under a second.
-_EARLY_HANDOFF_BYTES = _env_int("EARLY_HANDOFF_BYTES", 131_072)
+_EARLY_HANDOFF_BYTES = _env_int("EARLY_HANDOFF_BYTES", 16_000)  # SPEED: WebM/Opus header + audio fits in a small prefix
 # Minimum share of the total file that must be on disk before handing off.
-_EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.01)
+_EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.001)
 # BUG FIX ("3 ghante ki movie download hone tak wait karta hai"): the ratio
 # above is only sane for small files. A percentage of a multi-GB movie is
 # itself gigabytes — waiting for 35% of a 3 GB file means buffering ~1 GB
@@ -2419,7 +2427,7 @@ _EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.01)
 # far faster than 1x realtime playback, so that prefix keeps growing well
 # ahead of the reader for the rest of a multi-hour file.
 _EARLY_HANDOFF_LARGE_FILE_BYTES = _env_int("EARLY_HANDOFF_LARGE_FILE_BYTES", 10_000_000)
-_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 4_000_000)
+_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 32_000)
 # ROOT-CAUSE FIX from the Aug 25 Heroku log:
 #   ffprobe check_stream failed (NoAudioSourceFound: No audio source found on
 #   "/tmp/melody_<id>_a.mp4.part")
@@ -2428,12 +2436,15 @@ _EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 4
 # containers reliably until the final atomic rename. Audio-only WebM/Opus/MP3
 # can opt into the validated prefix path below; the shared future and download
 # gate still wait for the complete file before any cache/persistence operation.
-_EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", False) and not _ON_CLOUD_HOST
+# SPEED FIX: cloud hosts are exactly where the direct CDN route is blocked
+# and every play falls back to a download, so early handoff matters MOST
+# there. Enable it by default everywhere (EARLY_HANDOFF=0 to opt out).
+_EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", True)
 # Audio-only WebM/Opus files carry their decode headers at the beginning and
 # can be consumed safely while yt-dlp keeps appending ordered clusters. Enable
 # this path on cloud hosts by default; video/MP4/M4A remain completion-only.
 _EARLY_AUDIO_HANDOFF_ENABLED = _env_flag("EARLY_AUDIO_HANDOFF", True)
-_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav"}
+_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav", "mka"}
 
 
 def _early_handoff_allowed(audio_only: bool) -> bool:
@@ -2533,7 +2544,7 @@ def on_cloud_host() -> bool:
     return _ON_CLOUD_HOST
 # Hard ceiling on how long we wait for that early-handoff threshold before
 # giving up and blocking on the full download instead (pure fallback).
-_EARLY_HANDOFF_TIMEOUT = _env_float("EARLY_HANDOFF_TIMEOUT", 2.5)
+_EARLY_HANDOFF_TIMEOUT = _env_float("EARLY_HANDOFF_TIMEOUT", 2.0)
 # SPEED FIX ("gana 20 sec baad bajta hai"): the timeout above used to be a
 # HARD cutoff — miss it by a fraction of a second (very common, because yt-dlp
 # spends the first seconds only resolving metadata, before a single byte is
@@ -2573,15 +2584,16 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 _DOWNLOAD_LADDER: tuple = (
     {},                                                        # as configured
     {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
-    {"_client": ["android_music", "android", "android_vr"],  # mobile APIs
-     "concurrent_fragment_downloads": 1},
+    {"_client": ["android_vr", "web_safari"]},                 # different API surface
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
-    {"_format": "bestaudio/best", "_client": ["tv", "web"]},   # format vanished
+    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best",
+     "_client": ["tv", "web"]},                                # format vanished
     # Last rung — never merge, never post-process. Fixes the recurring
     # "_stream_track failed ... YoutubeDL.post_process → run_all_pps"
     # crash, which is always an ffmpeg merge/convert failure on a DASH
     # video pair, by falling back to a single already-muxed file.
-    {"_format": "bestaudio/best", "_no_merge": True},
+    {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/bestaudio/best",
+     "_no_merge": True},
     # ROOT-CAUSE FIX ("ERROR: The downloaded file is empty", repeated for every
     # rung, followed by "_stream_track failed"): YouTube hands SABR-only
     # streaming URLs to the default/web clients. yt-dlp resolves them, starts
@@ -2589,10 +2601,17 @@ _DOWNLOAD_LADDER: tuple = (
     # clients still advertise plain progressive/DASH URLs, and asking for a
     # protocol-restricted (https-only, no SABR/HLS manifest) format keeps the
     # native downloader on a URL that actually returns bytes.
-    {"_client": ["tv_simply", "tv"], "_format": "bestaudio[protocol^=http]/bestaudio/best",
+    {"_client": ["tv_simply", "tv"],
+     "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
+                "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
+                "bestaudio[format_id=251]/bestaudio[format_id=250]/bestaudio[format_id=249]/"
+                "bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio/best",
      "concurrent_fragment_downloads": 1, "_no_merge": True},
     {"_client": ["web_safari", "web_embedded"],
-     "_format": "bestaudio[protocol^=http]/bestaudio/best", "_no_merge": True},
+     "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
+                "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
+                "bestaudio[format_id=251]/bestaudio[format_id=140]/"
+                "bestaudio[protocol^=http]/bestaudio/best", "_no_merge": True},
 )
 
 
