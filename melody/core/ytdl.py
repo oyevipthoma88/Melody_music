@@ -53,6 +53,44 @@ try:
 except Exception:  # noqa: BLE001
     _INNERTUBE_HEADSTART = 0.20
 
+# Heroku/cloud IPs can return no usable InnerTube stream for every player
+# client. Repeating that dead fan-out on every /play adds several seconds before
+# the cookie-authenticated yt-dlp path even gets a chance. Mute the host-level
+# InnerTube stream probe after consecutive failures and periodically re-test.
+try:
+    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "1")))
+except Exception:  # noqa: BLE001
+    _IT_MUTE_AFTER = 1
+try:
+    _IT_MUTE_TTL = max(60.0, float(os.getenv("INNERTUBE_MUTE_TTL", "900")))
+except Exception:  # noqa: BLE001
+    _IT_MUTE_TTL = 900.0
+_it_stream_fail_streak = 0
+_it_stream_muted_until = 0.0
+
+
+def _innertube_stream_muted() -> bool:
+    return _it_stream_muted_until > _time_mod.monotonic()
+
+
+def _note_innertube_stream(ok: bool) -> None:
+    """Track consecutive host-level InnerTube direct-stream failures."""
+    global _it_stream_fail_streak, _it_stream_muted_until
+    if ok:
+        if _it_stream_muted_until or _it_stream_fail_streak:
+            LOGGER.info("#stream innertube direct path healthy again — re-enabled")
+        _it_stream_fail_streak = 0
+        _it_stream_muted_until = 0.0
+        return
+    _it_stream_fail_streak += 1
+    if _it_stream_fail_streak >= _IT_MUTE_AFTER and not _innertube_stream_muted():
+        _it_stream_muted_until = _time_mod.monotonic() + _IT_MUTE_TTL
+        LOGGER.info(
+            "#stream innertube blocked on this host (%d/%d) — skipping direct "
+            "InnerTube probes for %.0fs, using cookie yt-dlp first",
+            _it_stream_fail_streak, _IT_MUTE_AFTER, _IT_MUTE_TTL,
+        )
+
 # How long the fast metadata race (YouTube Data API v3 + InnerTube) is given
 # before falling back to yt-dlp. Kept short on purpose — see
 # _get_video_info_once() for why sequential fallback used to cost 5-10s even
@@ -4377,6 +4415,7 @@ def _resolve_stream_urls_innertube(video_id: str, want_video: bool) -> dict:
     info = _innertube_streams_sync(video_id, want_video=want_video)
     picked = (info or {}).get("_picked") or _pick_stream_formats(info or {}, want_video)
     if not picked:
+        _note_innertube_stream(False)
         raise ValueError("innertube: no directly streamable format")
     picked["is_live"] = bool((info or {}).get("is_live"))
     picked["headers"] = {
@@ -4390,6 +4429,7 @@ def _resolve_stream_urls_innertube(video_id: str, want_video: bool) -> dict:
     }
     urls = [u for u in (picked.get("video"), picked.get("audio")) if u]
     picked["expires_at"] = min(_url_expiry(u) for u in urls) - _STREAM_URL_SAFETY_MARGIN
+    _note_innertube_stream(True)
     return picked
 
 
@@ -5088,7 +5128,7 @@ async def resolve_stream_urls(
         # latency was coming from.
         tasks = []
         it_task = None
-        if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or ""):
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or "") and not _innertube_stream_muted():
             it_task = asyncio.ensure_future(
                 loop.run_in_executor(YTDL_POOL, _resolve_stream_urls_innertube, vid_only, want_video)
             )

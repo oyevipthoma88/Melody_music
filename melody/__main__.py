@@ -783,6 +783,18 @@ async def main():
     if Config.BGUTIL_STARTUP_WARMUP or Config.STARTUP_WARMUPS:
         from melody.core.ytdl import warm_up_bgutil_server
         spawn(warm_up_bgutil_server())
+    # Prime yt-dlp player-JS/nsig state and the direct-CDN resolver in the
+    # background. Without this, the first /play after a deploy pays the cold
+    # resolver penalty even though bgutil itself is already warm.
+    if not Config._LOW_MEMORY_PROFILE or Config.STARTUP_WARMUPS:
+        async def _warm_direct_resolver() -> None:
+            try:
+                from melody.core.ytdl import resolve_stream_urls
+                await resolve_stream_urls("dQw4w9WgXcQ", force=True)
+                LOGGER.info("✅ direct-CDN resolver pre-warmed (first /play stays fast)")
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.info("direct-CDN resolver warmup skipped: %s", exc)
+        spawn(_warm_direct_resolver())
     if Config.STARTUP_WARMUPS:
         from melody.core.ytdl import warm_popular_metadata
         spawn(warm_popular_metadata())
