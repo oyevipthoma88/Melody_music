@@ -376,10 +376,13 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
                     return_exceptions=True,
                 )
 
-        # The current track must have one playback owner. Starting a second
-        # warm resolver here duplicates InnerTube/yt-dlp work and can delay or
-        # poison the direct-stream result. Queue/autoplay prefetch remains
-        # responsible for background warming of future tracks.
+        # SPEED FIX: warm ONLY the cheap metadata resolve, in the background,
+        # the instant the video id is known. resolve_stream_urls() dedupes on a
+        # per-video lock and caches its result, so this does not duplicate the
+        # work call.py does — it simply moves it earlier, overlapping it with
+        # the VC join and the "processing" message instead of paying for it
+        # after the user is already waiting.
+        spawn(_warm_sources(info["id"], video), name=f"warm-src-{info['id']}")
 
         track = Track(
             video_id=info["id"],

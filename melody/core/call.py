@@ -55,7 +55,7 @@ try:
     # The fallback downloader must start immediately. A fixed grace period
     # made a blocked/slow direct resolver add latency even though the fallback
     # was the only source that could eventually play on cloud dynos.
-    configured_download_delay = float(os.getenv("DOWNLOAD_START_DELAY", "0.0"))
+    configured_download_delay = float(os.getenv("DOWNLOAD_START_DELAY", "1.5"))
 except Exception:  # noqa: BLE001
     configured_download_delay = 0.0
 # Start direct resolution and the fallback downloader in parallel. The old
@@ -103,11 +103,16 @@ try:
     # gets a hard 4s budget. Whatever is ready first — direct CDN URL or the
     # early WebM/Opus prefix of the fallback download — starts the song; the
     # rest keeps downloading in the background.
+    # SPEED FIX: 4s was SHORTER than a cold yt-dlp direct resolve on a 1-CPU
+    # dyno (Heroku logs: 9.8s and 27.7s startups). The budget expired every
+    # time, the direct URL was thrown away and playback waited on the download
+    # instead. The race still exits the INSTANT any source is ready, so a
+    # larger ceiling costs nothing on the happy path and saves the slow one.
     _PLAY_START_BUDGET = max(
-        2.0, min(10.0, float(os.getenv("PLAY_START_BUDGET", "4.0")))
+        2.0, min(12.0, float(os.getenv("PLAY_START_BUDGET", "8.0")))
     )
 except Exception:  # noqa: BLE001
-    _PLAY_START_BUDGET = 4.0
+    _PLAY_START_BUDGET = 8.0
 try:
     # The source race is intentionally short, but a fallback download that has
     # already started must not be cancelled at that boundary. Give it its own
@@ -1583,7 +1588,18 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             async def _delayed_download(delay: float):
                 nonlocal download_cancelled
                 if delay > 0:
-                    await asyncio.sleep(delay)
+                    # Wait for the direct resolve rather than a blind sleep: on
+                    # a 1-CPU dyno yt-dlp + ffmpeg starved the ~300ms InnerTube
+                    # call that would have started the song immediately. If the
+                    # direct path dies early we do NOT burn the rest of the
+                    # window — the download starts the moment it fails.
+                    if direct_task is not None:
+                        try:
+                            await asyncio.wait({direct_task}, timeout=delay)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    else:
+                        await asyncio.sleep(delay)
                 try:
                     filepath = await download_audio(
                         track.video_id, audio_only=not video, priority=priority,
@@ -1768,7 +1784,10 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         # stopping/restarting the song from zero. The fallback starts only
         # after the direct-first grace window, so it cannot starve resolution.
         if direct_task is not None and direct_task in pending:
-            direct_task.cancel()
+            # Let the resolve finish in the background: resolve_stream_urls()
+            # caches its own result, so the next play of this song (retry,
+            # loop, auto-advance) starts instantly instead of racing again.
+            direct_task.add_done_callback(_consume_task_exception)
         if early_task is not None and not early_task.done():
             early_task.cancel()
         if filepath is None and download_task is not None:

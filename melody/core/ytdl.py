@@ -40,16 +40,16 @@ try:
     # Keep direct resolution bounded because the local download races it. An
     # 8s resolver plus the Invidious rescue used to delay playback even when
     # the fallback file was already progressing.
-    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "6.0"))
+    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "9.0"))
 except ValueError:
     _RESOLVE_TIMEOUT = 6.0
-_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "4.0")))
+_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "9.0")))
 _RESOLVE_TIMEOUT = min(_RESOLVE_TIMEOUT, _DIRECT_RESOLVE_MAX)
 
 # How long InnerTube gets the CPU/network to itself before the heavy yt-dlp
 # fallback is started as well (see resolve_stream_urls).
 try:
-    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.60"))
+    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "1.20"))
 except Exception:  # noqa: BLE001
     _INNERTUBE_HEADSTART = 0.60
 
@@ -74,8 +74,21 @@ def _innertube_stream_muted() -> bool:
 
 
 def direct_stream_muted() -> bool:
-    """Return whether this host should bypass the known-dead direct probe."""
-    return _innertube_stream_muted()
+    """Whether the WHOLE direct-CDN path should be skipped for this host.
+
+    SPEED ROOT-CAUSE FIX (Heroku log: every /play logged `stream=9.8-27.3s`
+    and no `#stream resolved direct ...` line at all): this used to return
+    True as soon as the *InnerTube* probe had failed a few times, which also
+    disabled the cookie-authenticated **yt-dlp** direct resolve — the only
+    direct path that still works from a blocked datacenter IP. With both
+    muted, every single song had to be downloaded in full (or to its early
+    prefix) before a note was heard.
+
+    Only the InnerTube fan-out is muted now (see `_innertube_stream_muted`);
+    the yt-dlp direct resolve always gets its chance, and DIRECT_STREAM=false
+    remains the explicit host-level opt-out.
+    """
+    return False
 
 
 def _note_innertube_stream(ok: bool) -> None:
@@ -4490,7 +4503,11 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
 
         status = ((data.get("playabilityStatus") or {}).get("status") or "").upper()
         if status not in ("OK", "LIVE_STREAM_OFFLINE"):
-            LOGGER.debug("InnerTube %s for %s -> %s", client_name, video_id, status or "?")
+            # INFO, not DEBUG: when every client answers LOGIN_REQUIRED /
+            # UNPLAYABLE the direct path silently dies and every song falls
+            # back to a full download. That is exactly the "gana late bajta
+            # hai" symptom, and the logs used to show nothing about it.
+            LOGGER.info("#stream innertube %s for %s -> %s", client_name, video_id, status or "?")
             return None
 
         sd = data.get("streamingData") or {}
@@ -5239,6 +5256,27 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
     return picked
 
 
+def _cache_late_resolve(key: str):
+    """Cache a direct-resolve result that arrived after the race budget."""
+
+    def _done(task) -> None:
+        try:
+            late = task.result()
+        except Exception:  # noqa: BLE001 - a late failure is just a loser
+            return
+        if not late:
+            return
+        cached = _stream_url_cache.get(key)
+        if cached and cached.get("expires_at", 0) > _time_mod.time():
+            return
+        _stream_url_cache[key] = late
+        _stream_url_failures.pop(key, None)
+        _prune_stream_url_state()
+        LOGGER.info("🔗 #stream late direct resolve cached for %s", key)
+
+    return _done
+
+
 async def resolve_stream_urls(
     video_id: str, want_video: bool = False, *, force: bool = False,
 ) -> dict:
@@ -5376,8 +5414,14 @@ async def resolve_stream_urls(
                 if resolved:
                     break
         finally:
+            # SPEED FIX: a resolve that is still running when the budget ends
+            # used to be cancelled outright, throwing away work that was often
+            # only a fraction of a second from finishing. The extraction thread
+            # keeps running anyway, so let it finish and CACHE its result — the
+            # retry, the next queue item and the auto-advance of the same song
+            # then start instantly instead of paying the whole cost again.
             for t in pending:
-                t.cancel()
+                t.add_done_callback(_cache_late_resolve(key))
 
         if not resolved and re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or ""):
             # Public Invidious metadata is slower and less predictable than
@@ -5394,14 +5438,22 @@ async def resolve_stream_urls(
                 last_exc = exc
 
         if not resolved:
-            _stream_url_failures[key] = _time_mod.monotonic() + _STREAM_URL_FAILURE_TTL
+            # Only remember a *real* failure. A resolve that merely ran out of
+            # budget while still working must not poison the next attempt with
+            # a cached "direct stream temporarily unavailable".
+            if not pending:
+                _stream_url_failures[key] = _time_mod.monotonic() + _STREAM_URL_FAILURE_TTL
+            LOGGER.info(
+                "#stream direct resolve gave up for %s after %.2fs (pending=%d): %s",
+                video_id, _time_mod.monotonic() - _t0, len(pending), last_exc,
+            )
             raise last_exc or ValueError("no directly streamable http format found")
         _stream_url_failures.pop(key, None)
         _stream_url_cache[key] = resolved
         _prune_stream_url_state()
         LOGGER.info(
-            "🔗 #stream resolved direct %s URLs for %s (no download)",
+            "🔗 #stream resolved direct %s URLs for %s in %.2fs (no download)",
             "video+audio" if want_video else "audio",
-            video_id,
+            video_id, _time_mod.monotonic() - _t0,
         )
         return resolved
