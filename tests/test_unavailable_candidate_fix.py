@@ -1,6 +1,14 @@
 import asyncio
+from pathlib import Path
 
 from melody.core import ytdl
+
+
+def test_attached_log_message_is_classified_as_unavailable():
+    """The curly-apostrophe yt-dlp error must use alternate-track recovery."""
+    source = Path("melody/core/call.py").read_text(encoding="utf-8")
+    assert '"this content isn’t available"' in source
+    assert '"this content isn\'t available"' in source
 
 
 async def _run():

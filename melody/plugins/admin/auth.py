@@ -51,6 +51,8 @@ async def unauth_cmd(client: Client, message: Message):
 @bot.on_message(filters.command("authlist") & filters.group)
 @error_handler
 async def authlist_cmd(client: Client, message: Message):
+    if not await _is_admin(client, message):
+        return await message.reply(quote_html("⚠️ Admins only."), parse_mode=enums.ParseMode.HTML)
     auth_ids = await get_auth_users(message.chat.id)
     if not auth_ids:
         return await message.reply(
@@ -69,8 +71,11 @@ async def authlist_cmd(client: Client, message: Message):
 
 async def _is_admin(client: Client, message: Message) -> bool:
     try:
+        if not message.from_user:
+            return False
         member = await client.get_chat_member(message.chat.id, message.from_user.id)
-        return member.status in ("administrator", "creator")
+        status = getattr(member.status, "value", member.status)
+        return str(status).lower() in {"administrator", "creator", "owner"}
     except Exception:
         return False
 

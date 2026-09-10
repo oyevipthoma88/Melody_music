@@ -58,13 +58,12 @@ def get_play_buttons(
     chat_title: str,
     autoplay_on: bool = False,
     bot_username: "str | None" = None,
-    bot_name: str = "Apex Vibes",
-    chat_type: "enums.ChatType | None" = None,
+    bot_name: str = "Melody Music",
+    _chat_type: "enums.ChatType | None" = None,
     chat_id: int = 0,
     paused: bool = False,
 ) -> InlineKeyboardMarkup:
-    """Play-card keyboard — premium-emoji labels (aage + piche) and real
-    coloured buttons, built by `utils.inline` (AnonXMusic-style)."""
+    """Build Melody's premium play-card keyboard with safe button fallbacks."""
     from utils.inline import inline
 
     return inline.play_card(
@@ -126,7 +125,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
         return
 
     # 🔎 Inline play mode (/playmode inline) — instead of auto-playing the top
-    # hit, show the 5 best matches as tappable buttons (Yukki/AnonX parity).
+    # hit, show the five best matches as tappable buttons.
     # Only for a plain text query: links and tagged media are unambiguous, and
     # forcing a chooser on them would just add a pointless extra tap.
     if query and not tagged and not force and not query.lower().startswith(("http://", "https://")):
@@ -164,32 +163,18 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
             )
             return
 
-    # Known YouTube links/IDs are unambiguous. Start their direct stream
-    # resolver before metadata enrichment; resolve_stream_urls() has its own
-    # single-flight lock/cache, so _warm_sources/_build_direct_stream reuse it.
+    # A manual request owns the single safe yt-dlp slot. Stop only lower
+    # priority background work; never start a second direct resolver for the
+    # same track. `_stream_track()` is the single owner of direct resolution
+    # and its bounded fallback race.
+    direct_id = None
     if query and not tagged:
         from melody.core.ytdl import extract_video_id, is_valid_video_id
         direct_id = extract_video_id(query) or (
             query.strip() if is_valid_video_id(query.strip()) else None
         )
-        if direct_id:
-            async def _warm_direct_source():
-                try:
-                    from melody.core.ytdl import resolve_stream_urls
-                    await resolve_stream_urls(direct_id, want_video=video)
-                except Exception as exc:
-                    LOGGER.debug("early direct warm failed for %s: %s", direct_id, exc)
-
-            spawn(_warm_direct_source(), name=f"direct-warm-{direct_id}")
-
-        # A manual request owns the single safe yt-dlp slot. Stop only lower
-        # priority background work; never cancel a same-video shared download
-        # that this request can safely deduplicate onto.
         from melody.core.ytdl import cancel_lower_priority_downloads
-        cancel_lower_priority_downloads(
-            max_priority=0,
-            exclude_video_id=direct_id,
-        )
+        cancel_lower_priority_downloads(max_priority=0, exclude_video_id=direct_id)
 
     if not (query and not tagged):
         from melody.core.ytdl import cancel_lower_priority_downloads
@@ -391,9 +376,10 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
                     return_exceptions=True,
                 )
 
-        warm_task = asyncio.create_task(_warm_sources(info["id"], video))
-        _bg_downloads.add(warm_task)
-        warm_task.add_done_callback(_bg_downloads.discard)
+        # The current track must have one playback owner. Starting a second
+        # warm resolver here duplicates InnerTube/yt-dlp work and can delay or
+        # poison the direct-stream result. Queue/autoplay prefetch remains
+        # responsible for background warming of future tracks.
 
         track = Track(
             video_id=info["id"],

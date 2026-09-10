@@ -6,7 +6,10 @@ import html
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message
 from melody import bot
-from melody.core.queue import set_autoplay, is_autoplay_on, get_current, add_to_queue, set_predownloaded
+from melody.core.queue import (
+    set_autoplay, is_autoplay_on, get_current, add_to_queue, set_predownloaded,
+    autoplay_generation,
+)
 from melody.core.autoplay import prefetch_next
 from melody.logging import log_activity
 from utils.decorators import admin_or_auth, error_handler
@@ -50,9 +53,10 @@ async def autoplay_cmd(client: Client, message: Message):
         # it right away and it plays automatically the moment the current
         # song ends — no separate AutoPlay hand-off needed.
         if get_current(chat.id):
+            generation = autoplay_generation(chat.id)
             async def _queue_next_autoplay_track():
                 track = await prefetch_next(chat.id)
-                if track:
+                if track and generation == autoplay_generation(chat.id) and await is_autoplay_on(chat.id):
                     add_to_queue(chat.id, track)
                     # BUG FIX ("autoplay on hota hai but uske baad kuch nahi
                     # hota hai"): this track is now tracked by the VISIBLE

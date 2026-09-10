@@ -403,7 +403,7 @@ async def cb_reload(client: Client, cb: CallbackQuery):
 
     reloaded, failed = [], []
     import melody.plugins as plugins_pkg
-    for finder, name, ispkg in pkgutil.walk_packages(
+    for _finder, name, _ispkg in pkgutil.walk_packages(
         plugins_pkg.__path__, plugins_pkg.__name__ + "."
     ):
         try:

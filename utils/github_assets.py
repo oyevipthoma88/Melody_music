@@ -42,6 +42,8 @@ async def push_to_github(local_path: str, gh_path: str, commit_message: str = ""
     """
     if not _enabled():
         return False, "MONGO_DB_URI not set — skipping persistent asset save."
+    if commit_message:
+        LOGGER.debug("Asset persistence request: %s", commit_message)
     try:
         data = await asyncio.to_thread(pathlib.Path(local_path).read_bytes)
     except OSError as e:

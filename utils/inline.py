@@ -1,6 +1,5 @@
 """
-🎛 Central inline-keyboard factory (ported from AnonXMusic `helpers/_inline.py`
-and adapted to Melody).
+🎛 Central inline-keyboard factory for Melody's play cards and utility panels.
 
 Two things the owner asked for, in one place:
 
@@ -14,7 +13,7 @@ Two things the owner asked for, in one place:
 
 2. **Real button colours** — Telegram's newer layer exposes
    `enums.ButtonStyle` (`PRIMARY` / `DANGER` / `SUCCESS` / `DEFAULT`) on
-   `InlineKeyboardButton`, which is what AnonXMusic uses. Older Pyrogram
+   `InlineKeyboardButton`, which is supported by newer Telegram client/library builds. Older Pyrogram
    builds have no `style=` kwarg at all, so `sbtn()` probes once and silently
    drops the colour instead of crashing the whole keyboard with
    `TypeError: unexpected keyword argument 'style'`.
@@ -111,7 +110,7 @@ CLOSE_LABEL = deco("close", "Close")
 #  Keyboards
 # ─────────────────────────────────────────────────────────────────────────────
 class Inline:
-    """Melody's inline keyboards (AnonXMusic `Inline` equivalent)."""
+    """Melody's centralized inline keyboard collection."""
 
     ikm = InlineKeyboardMarkup
 

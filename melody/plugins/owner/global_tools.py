@@ -1,7 +1,7 @@
 """
 🌍 Owner/sudo global tooling that Melody was missing.
 
-Every top music bot (Yukki, AnonXMusic, VIPMusic, TgMusicBot) ships the *list*
+Melody exposes the complete *list*
 and *chat-level* half of the global moderation surface. Melody had /gban and
 /botban but no way to audit or undo them, and no chat blacklist at all:
 

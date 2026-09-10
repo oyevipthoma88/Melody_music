@@ -21,9 +21,18 @@ from aiohttp.client_exceptions import ClientConnectionError, ClientConnectionRes
 from melody.logging import LOGGER
 
 _CHUNK_BYTES = 1024 * 1024
-_MAX_PROXIES = 64
-_PROXY_TTL = 6 * 3600.0
-_PROXY_CONCURRENCY = 4
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except (TypeError, ValueError):
+        return default
+
+
+# Registry entries are tiny; the actual movie bytes remain in Telegram.
+_MAX_PROXIES = _env_int("TG_PROXY_MAX_ENTRIES", 1024, 64)
+_PROXY_TTL = max(300.0, float(os.getenv("TG_PROXY_TTL_SECONDS", "21600")))
+_PROXY_CONCURRENCY = _env_int("TG_PROXY_CONCURRENCY", 32, 4)
 
 
 @dataclass
@@ -37,6 +46,10 @@ class _MediaEntry:
 
 
 _entries: dict[str, _MediaEntry] = {}
+# (source chat id, message id) -> active proxy token. This prevents 100 users
+# requesting the same movie from creating 100 independent Telegram range
+# proxy entries and keeps the proxy registry bounded under fan-out.
+_source_tokens: dict[tuple[int, int], str] = {}
 _runner: web.AppRunner | None = None
 _port: int | None = None
 _server_lock = asyncio.Lock()
@@ -48,10 +61,16 @@ def _prune() -> None:
     for token, entry in list(_entries.items()):
         if now - entry.touched > _PROXY_TTL:
             _entries.pop(token, None)
+            for key, mapped in list(_source_tokens.items()):
+                if mapped == token:
+                    _source_tokens.pop(key, None)
     if len(_entries) > _MAX_PROXIES:
         victims = sorted(_entries, key=lambda token: _entries[token].touched)
         for token in victims[: len(_entries) - _MAX_PROXIES]:
             _entries.pop(token, None)
+            for key, mapped in list(_source_tokens.items()):
+                if mapped == token:
+                    _source_tokens.pop(key, None)
 
 
 def _content_type(name: str, fallback: str | None = None) -> str:
@@ -195,6 +214,14 @@ async def create_media_proxy(client, message, *, size: int, filename: str = "med
     if size <= 0:
         raise ValueError("Telegram media size is unavailable")
     port = await _ensure_server()
+    source_key = (int(getattr(message, "chat", None).id), int(getattr(message, "id")))
+    _prune()
+    existing_token = _source_tokens.get(source_key)
+    existing = _entries.get(existing_token) if existing_token else None
+    if existing is not None and existing.size == size:
+        existing.touched = time.monotonic()
+        return f"http://127.0.0.1:{port}/tg/{existing_token}/{quote(existing.name, safe='')}"
+
     token = uuid.uuid4().hex
     name = os.path.basename(filename or "media")
     _entries[token] = _MediaEntry(
@@ -205,6 +232,7 @@ async def create_media_proxy(client, message, *, size: int, filename: str = "med
         name=name,
         touched=time.monotonic(),
     )
+    _source_tokens[source_key] = token
     _prune()
     return f"http://127.0.0.1:{port}/tg/{token}/{quote(name, safe='')}"
 
@@ -217,3 +245,4 @@ async def close_media_proxy_server() -> None:
         _runner = None
         _port = None
         _entries.clear()
+        _source_tokens.clear()

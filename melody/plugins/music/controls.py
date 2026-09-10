@@ -15,7 +15,7 @@ from melody.core.call import (
 )
 from melody.core.queue import (
     format_queue, get_current, is_autoplay_on, set_autoplay,
-    add_to_queue, set_predownloaded,
+    add_to_queue, set_predownloaded, autoplay_generation,
 )
 from melody.core.autoplay import prefetch_next
 from melody.logging import LOGGER, log_activity
@@ -133,7 +133,7 @@ async def skip_cmd(client: Client, message: Message):
         return
 
     # MISSING-FEATURE PARITY: `/skip <n>` jumps straight to queue position n
-    # (Yukki/AnonXMusic/VIPMusic all support it). Everything before position n
+    # Everything before position n
     # is dropped, then the normal skip advances into it.
     if len(message.command) > 1:
         from melody.core.queue import remove_from_queue
@@ -281,9 +281,10 @@ async def autoplay_toggle_callback(client: Client, cb: CallbackQuery):
     await cb.answer(f"🤖 AutoPlay {'ON 🟢' if new_state else 'OFF 🔴'}")
 
     if new_state and get_current(chat_id):
+        generation = autoplay_generation(chat_id)
         async def _queue_next_autoplay_track():
             track = await prefetch_next(chat_id)
-            if track:
+            if track and generation == autoplay_generation(chat_id) and await is_autoplay_on(chat_id):
                 add_to_queue(chat_id, track)
                 set_predownloaded(chat_id, None)
         spawn(_queue_next_autoplay_track())
@@ -347,7 +348,7 @@ async def lyrics_callback(client: Client, cb: CallbackQuery):
         await send_quote(cb.message, "❌ Could not fetch lyrics.", client=client)
 
 
-# ─── AnonXMusic-style unified `controls <action> <chat_id>` router ────────────
+# ─── Unified `controls <action> <chat_id>` router ────────────
 #
 # The new premium/coloured play card (utils/inline.py) sends one callback
 # scheme for every transport button, carrying the target chat id so the card

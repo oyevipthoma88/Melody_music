@@ -177,10 +177,10 @@ async def release(chat_id: int) -> None:
 async def _startup_scan() -> None:
     """After a restart, find chats that already have a live voice chat."""
     try:
-        from utils.database import get_all_chats
+        from utils.database import get_chats_page
         from melody.core.vc_notify import call_is_live
 
-        chats = [c.get("chat_id") for c in await get_all_chats()]
+        chats = [c.get("chat_id") for c in await get_chats_page(limit=400)]
     except Exception as exc:  # noqa: BLE001
         LOGGER.debug("vc_listener startup scan skipped: %s", exc)
         return

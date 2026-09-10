@@ -25,6 +25,7 @@ things the callers need, with no dependency on high-level wrapper fields.
 from typing import Dict, Iterable, Optional
 
 import logging
+import time
 
 from pyrogram import raw
 
@@ -53,6 +54,8 @@ class EmojiResolutionUnavailable(RuntimeError):
 # Set to False once Telegram tells us this account may not call the method at
 # all, so we stop paying for a round-trip that can never succeed.
 RESOLUTION_SUPPORTED = True
+_RESOLUTION_RETRY_AT = 0.0
+_RESOLUTION_RETRY_COOLDOWN = 60.0
 
 _UNSUPPORTED_MARKERS = ("BOT_METHOD_INVALID", "METHOD_INVALID", "USER_BOT_INVALID")
 
@@ -67,7 +70,7 @@ async def resolve_custom_emoji(client, ids: Iterable[int]) -> Dict[int, Optional
     all (network error, or a bot account that may not call the method) — that
     is "unknown", not "invalid".
     """
-    global RESOLUTION_SUPPORTED
+    global RESOLUTION_SUPPORTED, _RESOLUTION_RETRY_AT
     wanted = [int(i) for i in dict.fromkeys(ids)]
     resolved: Dict[int, Optional[str]] = {}
 
@@ -77,16 +80,26 @@ async def resolve_custom_emoji(client, ids: Iterable[int]) -> Dict[int, Optional
         raise EmojiResolutionUnavailable(
             "messages.GetCustomEmojiDocuments is not available for this account"
         )
+    if time.monotonic() < _RESOLUTION_RETRY_AT:
+        raise EmojiResolutionUnavailable(
+            "custom-emoji verification is temporarily backing off after a timeout"
+        )
 
     failures = 0
     for start in range(0, len(wanted), MAX_IDS_PER_REQUEST):
         batch = wanted[start:start + MAX_IDS_PER_REQUEST]
         try:
-            documents = await client.invoke(
-                raw.functions.messages.GetCustomEmojiDocuments(document_id=batch)
+            # ⚡ SPEED FIX: 5s timeout to prevent RPC retry storms (25s+ CPU waste)
+            import asyncio
+            documents = await asyncio.wait_for(
+                client.invoke(
+                    raw.functions.messages.GetCustomEmojiDocuments(document_id=batch)
+                ),
+                timeout=5.0
             )
         except Exception as exc:  # noqa: BLE001 - never let this kill a send
             failures += 1
+            _RESOLUTION_RETRY_AT = time.monotonic() + _RESOLUTION_RETRY_COOLDOWN
             if any(m in str(exc).upper() for m in _UNSUPPORTED_MARKERS):
                 RESOLUTION_SUPPORTED = False
                 log.info(

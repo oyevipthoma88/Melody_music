@@ -197,6 +197,7 @@ HELP_PAGES = {
     "joinreq": (
         f"{headline('Join Requests')}\n\n"
         "<code>/joinrequests</code> <code>/rpending</code> <code>/pendingrequests</code> — 📋 Pending list\n"
+        "<code>/approverequest</code> / <code>/declinerequest</code> — ᴇᴋ request handle\n"
         "<code>/approveallrequests</code> <code>/rapproveall</code> <code>/joinapproveall</code> "
         "<code>/requestapproveall</code> — ✅ Sab approve\n"
         "<code>/declineallrequests</code> <code>/rdeclineall</code> <code>/rrejectall</code> "

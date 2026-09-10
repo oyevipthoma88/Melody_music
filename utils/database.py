@@ -8,6 +8,31 @@ from urllib.parse import urlsplit
 
 _SETTINGS_TTL = 45.0
 _settings_cache: dict[tuple[int, str], tuple[float, object]] = {}
+# Atlas blocks every write after the free/shared cluster reaches its storage
+# quota. Persistence is helpful but never a prerequisite for playback; stop
+# retrying after the first confirmed quota rejection so autoplay/background
+# tasks do not repeatedly raise OperationFailure or flood the error log.
+_STORAGE_WRITES_DISABLED = False
+
+
+def _is_storage_quota_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "over your space quota" in text
+        or "writes are blocked" in text
+        or ("atlaserror" in text and "quota" in text)
+        or "code 8000" in text
+    )
+
+
+def _disable_storage_writes(exc: Exception) -> None:
+    global _STORAGE_WRITES_DISABLED
+    if not _STORAGE_WRITES_DISABLED:
+        _STORAGE_WRITES_DISABLED = True
+        logging.getLogger("Melody").warning(
+            "Mongo persistence writes disabled for this process: Atlas storage quota is full; "
+            "playback continues in memory. (%s)", str(exc).split(", full error:", 1)[0],
+        )
 
 import motor.motor_asyncio
 from melody.config import Config, _validate_mongo_uri
@@ -187,11 +212,19 @@ async def is_gbanned(user_id: int) -> bool:
 # ─── Play history ─────────────────────────────────────────────────────────────
 
 async def add_history(chat_id: int, video_id: str, title: str = ""):
-    await history_col.update_one(
-        {"chat_id": chat_id},
-        {"$push": {"history": {"$each": [{"id": video_id, "title": title}], "$slice": -15}}},
-        upsert=True,
-    )
+    if _STORAGE_WRITES_DISABLED:
+        return
+    try:
+        await history_col.update_one(
+            {"chat_id": chat_id},
+            {"$push": {"history": {"$each": [{"id": video_id, "title": title}], "$slice": -15}}},
+            upsert=True,
+        )
+    except Exception as exc:
+        if _is_storage_quota_error(exc):
+            _disable_storage_writes(exc)
+            return
+        raise
 
 
 async def get_history(chat_id: int) -> list:
@@ -215,11 +248,21 @@ async def get_setting(chat_id: int, key: str, default=None):
 
 
 async def set_setting(chat_id: int, key: str, value):
-    await settings_col.update_one(
-        {"chat_id": chat_id},
-        {"$set": {key: value}},
-        upsert=True,
-    )
+    if _STORAGE_WRITES_DISABLED:
+        # Keep the process-local value useful even while Atlas is full.
+        _settings_cache[(int(chat_id), str(key))] = (time.monotonic() + _SETTINGS_TTL, value)
+        return
+    try:
+        await settings_col.update_one(
+            {"chat_id": chat_id},
+            {"$set": {key: value}},
+            upsert=True,
+        )
+    except Exception as exc:
+        if _is_storage_quota_error(exc):
+            _disable_storage_writes(exc)
+        else:
+            raise
     _settings_cache[(int(chat_id), str(key))] = (time.monotonic() + _SETTINGS_TTL, value)
 
 
@@ -237,7 +280,7 @@ async def get_stats() -> dict:
 
 
 # ─── Lists (gban / botban / blacklisted chats) ───────────────────────────────
-# Top music bots (Yukki / AnonXMusic / VIPMusic) all expose the *list* form of
+# The database helper exposes the *list* form of
 # every global action — /gbannedusers, /blockedusers, /blacklistedchats — but
 # Melody only had the add/remove half, so an owner could gban someone and then
 # have no way to audit or undo it without remembering the id. These read the

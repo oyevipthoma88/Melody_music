@@ -15,6 +15,7 @@ from pyrogram.types import LinkPreviewOptions
 from utils.buttons import ikb, ButtonStyle  # premium-emoji + styled buttons (safe on every fork)
 from melody import bot
 from melody.config import Config
+from utils.client_cache import get_me_cached
 from melody.logging import LOGGER, log_activity
 from utils.decorators import error_handler
 from utils.database import is_banned, is_gbanned, get_chat_owner
@@ -114,11 +115,13 @@ WELCOME_DM = (
     "<blockquote expandable>"
     "⚡ <b>Mᴀɪɴ ᴋʏᴀ ᴋᴀʀ sᴀᴋᴛᴀ ʜᴜ̃</b>\n"
     "┌ 🎵 <b>Music :</b> HD VC play · <code>/vplay</code> video · queue · loop · autoplay · lyrics\n"
+    "├ ⚡ <b>Fast playback :</b> direct stream + parallel download · next-track prefetch\n"
+    "├ 🎙 <b>VC chat log :</b> in-call messages mirror to the group and optional backup channel\n"
     "├ 👋 <b>Greetings :</b> welcome / goodbye cards with photo — <code>/welcome</code>\n"
-    "├ 🚪 <b>Join Requests :</b> one-tap accept/reject · <code>/rapproveall</code>\n"
-    "├ 🛠 <b>Admin Suite :</b> ban · mute · warn · purge · <code>/cleanall</code> · <code>/tagall</code>\n"
+    "├ 🚪 <b>Join Requests :</b> one-tap accept/reject · bulk approve/decline · <code>/rpending</code>\n"
+    "├ 🛠 <b>Admin Suite :</b> ban · mute · warn · purge · <code>/clean</code> · <code>/cleanall</code>\n"
     "├ 🛡 <b>Protection :</b> links · NSFW · flood · abuse filter\n"
-    "└ 👑 <b>Owner Assistant :</b> mass-ban / takeover se group bachata hai"
+    "└ 👑 <b>Owner Assistant :</b> audit logs, mass-action protection and takeover defense"
     "</blockquote>"
     "🚀 <b>3 sᴛᴇᴘ sᴇᴛᴜᴘ :</b> <i>Add karo → full admin do → </i><code>/play tum hi ho</code>\n"
     f"♛ <b>ʙʏ</b> <code>{html.escape(Config.OWNER_NAME)}</code> 💛"
@@ -134,7 +137,8 @@ WELCOME_GROUP = (
     "<blockquote expandable>"
     "🎵 <b>Mᴜsɪᴄ</b>\n"
     "┌ <code>/play</code> · <code>/vplay</code> · <code>/queue</code> · <code>/skip</code> · <code>/stop</code>\n"
-    "└ Loop · AutoPlay · Lyrics · live VC feed\n"
+    "└ Loop · AutoPlay · Lyrics · direct stream · next-track prefetch\n"
+    "🎙 <b>VC Chat Log</b> — in-call messages mirror to the group and optional backup channel\n"
     "🛠 <b>Mᴀɴᴀɢᴇᴍᴇɴᴛ</b>\n"
     "┌ <code>/welcome</code> — welcome & goodbye cards\n"
     "├ <code>/promote</code> · <code>/demote</code> · <code>/ban</code> · <code>/mute</code> · <code>/warn</code>\n"
@@ -189,11 +193,15 @@ def user_buttons() -> InlineKeyboardMarkup:
             ),
         ],
         [
+            ikb(btn("🎵 Music Guide"), callback_data="help_play", style=ButtonStyle.PRIMARY),
+            ikb(btn("🎙 VC Tools"), callback_data="help_vc", style=ButtonStyle.SUCCESS),
+        ],
+        [
             ikb(btn("⚡ What I Can Do"), callback_data="melody_tour"),
             ikb(btn("🛡 Why Admin Rights?"), callback_data="melody_trust"),
         ],
         [
-            ikb(btn("📢 Support"), url="https://t.me/+0000000000000000"),
+            ikb(btn("📢 Support"), **({"url": Config.SUPPORT_URL} if Config.SUPPORT_URL else {"callback_data": "about_cb"})),
             ikb(btn("ℹ About"), callback_data="about_cb"),
         ],
 
@@ -265,7 +273,7 @@ def new_group_buttons(owner_id: int = None, owner_name: str = None) -> InlineKey
             ikb(btn("⚡ Feature Tour", BLUE), callback_data="melody_tour"),
         ],
         [
-            ikb(btn("📢 Support Channel", BLUE), url="https://t.me/+0000000000000000"),
+            ikb(btn("📢 Support Channel", BLUE), **({"url": Config.SUPPORT_URL} if Config.SUPPORT_URL else {"callback_data": "about_cb"})),
             ikb(btn("ℹ About", BLUE), callback_data="about_cb"),
         ],
 
@@ -333,15 +341,21 @@ async def start_dm(client: Client, message: Message):
 @error_handler
 async def start_group(client: Client, message: Message):
     if message.from_user:
-        if await is_gbanned(message.from_user.id):
-            return
-        if await is_banned(message.from_user.id):
+        gbanned, banned = await asyncio.gather(
+            _start_db_call(is_gbanned(message.from_user.id), False),
+            _start_db_call(is_banned(message.from_user.id), False),
+        )
+        if gbanned or banned:
             return
 
     buttons = InlineKeyboardMarkup([
         [
             ikb(btn("▶ Play Music", RED), switch_inline_query_current_chat=""),
             ikb(btn("📖 Help", BLUE), callback_data="help_main"),
+        ],
+        [
+            ikb(btn("🎵 Music Guide", GREEN), callback_data="help_play"),
+            ikb(btn("🎙 VC Tools", GREEN), callback_data="help_vc"),
         ],
         [
             ikb(
@@ -365,7 +379,7 @@ async def start_group(client: Client, message: Message):
     )
     from utils.gc_db import get_pic
 
-    start_pic = await get_pic("start")
+    start_pic = await _start_db_call(get_pic("start"), None)
     if start_pic:
         try:
             return await message.reply_photo(
@@ -384,7 +398,7 @@ async def start_group(client: Client, message: Message):
 @bot.on_message(filters.new_chat_members)
 @error_handler
 async def new_group_handler(client: Client, message: Message):
-    bot_user = await client.get_me()
+    bot_user = await get_me_cached(client)
     for member in message.new_chat_members:
         if member.id != bot_user.id:
             continue
@@ -451,7 +465,11 @@ async def new_group_handler(client: Client, message: Message):
         # owner sets once shows up everywhere.
         from utils.gc_db import get_pic
 
-        welcome_pic = await get_pic("welcome") or await get_pic("start")
+        welcome_pic, start_pic = await asyncio.gather(
+            _start_db_call(get_pic("welcome"), None),
+            _start_db_call(get_pic("start"), None),
+        )
+        welcome_pic = welcome_pic or start_pic
         if not welcome_pic:
             welcome_pic = (
                 BG_WELCOME if os.path.exists(BG_WELCOME)

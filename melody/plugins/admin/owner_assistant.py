@@ -55,6 +55,7 @@ from pyrogram.types import (
 
 from melody import bot
 from melody.config import Config
+from utils.client_cache import get_me_cached
 from melody.logging import LOGGER, log_activity
 from utils.admin_tools import (
     MUTED_PERMS,
@@ -92,7 +93,7 @@ def _record(chat_id: int, actor_id: int, kind: str, window: int) -> int:
     return len(events)
 
 
-async def _group_owner(client: Client, chat_id: int) -> "tuple[int, str] | None":
+async def _group_owner(client: Client, chat_id: int) -> tuple[int, str] | None:
     cached = _owner_cache.get(chat_id)
     if cached and cached[0] > time.monotonic():
         return cached[1]
@@ -151,7 +152,7 @@ async def _is_protected(client: Client, chat_id: int, user_id: int) -> bool:
     except Exception:
         pass
     try:
-        me = await client.get_me()
+        me = await get_me_cached(client)
         if user_id == me.id:
             return True
     except Exception:

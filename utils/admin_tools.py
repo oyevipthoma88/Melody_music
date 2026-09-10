@@ -27,6 +27,7 @@ from pyrogram.types import (
 
 from melody.config import Config
 from utils.gc_db import is_sudo
+from utils.client_cache import get_me_cached
 
 ADMIN_STATUSES = (
     enums.ChatMemberStatus.OWNER,
@@ -212,7 +213,7 @@ async def protected_target(client, message: Message, user, allow_admin: bool = F
         return "👑 <b>Yᴇ ᴍᴇʀᴇ ᴏᴡɴᴇʀ ʜᴀɪ</b> — action denied."
     if await is_sudo(user.id):
         return "⚡ <b>Sᴜᴅᴏ ᴜsᴇʀ</b> — action denied."
-    me = await client.get_me()
+    me = await get_me_cached(client)
     if user.id == me.id:
         return "🎶 <b>Mᴜᴊʜ ᴘᴇ ʜɪ ?</b> Nice try 😌"
     member = await get_status(client, message.chat.id, user.id)

@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
-  - name: MelodiX Support
-    url: https://t.me/MelodiXSupport
+  - name: Melody Support
+    url: https://github.com/oyevipthoma88/Melody_music/issues
     about: Direct chat on non-inquiries subjects.
   - name: Documentation
-    url: https://MelodiX.tech/
+    url: https://github.com/oyevipthoma88/Melody_music
     about: Documentation for getting started with bot.

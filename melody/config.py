@@ -104,6 +104,8 @@ class Config:
     # Disabled unless the deployer explicitly configures a private backup
     # channel. Never inherit a channel ID from another bot instance.
     VC_CHAT_LOG_CHANNEL_ID: int = _env_int("VC_CHAT_LOG_CHANNEL_ID")
+    # Fallback music files are archived in Telegram, never MongoDB.
+    MUSIC_ARCHIVE_CHANNEL_ID: int = _env_int("MUSIC_ARCHIVE_CHANNEL_ID")
 
     # YouTube
     YT_COOKIES: str = _env_str("YT_COOKIES")
@@ -127,6 +129,8 @@ class Config:
     # social and utility handlers. Full Melody remains the default.
     MUSIC_ONLY_MODE: bool = _env_bool("MUSIC_ONLY_MODE", False)
     BOT_USERNAME: str = _env_str("BOT_USERNAME").lstrip("@")
+    SUPPORT_URL: str = _env_str("SUPPORT_URL")
+    SOURCE_CODE_URL: str = _env_str("SOURCE_CODE_URL")
     # Welcome animated sticker (file_id of any Telegram sticker/animation)
     # Set in .env: WELCOME_STICKER=<file_id>
     # To get a file_id: forward any sticker to your bot and use /eval to print it
@@ -141,9 +145,13 @@ class Config:
     STARTUP_WARMUPS: bool = (
         _env_bool("STARTUP_WARMUPS", False) and not _LOW_MEMORY_PROFILE
     )
+    # The bgutil HTTP server is a single persistent process and is required
+    # for fast direct YouTube URL resolution. Disabling it on 512 MB dynos
+    # pushed its Deno startup into the first /play request, adding 3–6s and
+    # making the direct path lose to the slow full-download fallback. It is
+    # still explicitly opt-out via BGUTIL_STARTUP_WARMUP=false.
     BGUTIL_STARTUP_WARMUP: bool = (
-        _env_bool("BGUTIL_STARTUP_WARMUP", MEMORY_LIMIT_MB > 768)
-        and not _LOW_MEMORY_PROFILE
+        _env_bool("BGUTIL_STARTUP_WARMUP", True)
     )
     # Recovery re-joins every active snapshot after a dyno restart. On a
     # 512MB dyno this can start many simultaneous voice/download transitions

@@ -33,6 +33,7 @@ from utils.admin_tools import (
     is_admin,
     mention,
 )
+from utils.client_cache import get_me_cached
 from utils.database import ban_user, is_banned, unban_user
 from utils.decorators import error_handler
 from utils.tasks import spawn
@@ -58,7 +59,7 @@ async def ban_cmd(client: Client, message: Message):
         return await message.reply(
             card("Nᴏᴘᴇ", "❌ Owner ko ban nahi kar sakte."), parse_mode=enums.ParseMode.HTML
         )
-    if user.id == (await client.get_me()).id:
+    if user.id == (await get_me_cached(client)).id:
         return await message.reply(
             card("Nᴏᴘᴇ", "🤖 Main khud ko ban nahi karungi."), parse_mode=enums.ParseMode.HTML
         )

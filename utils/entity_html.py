@@ -38,7 +38,7 @@ _SIMPLE_TAGS = {
 }
 
 
-def _open_close(entity, text_slice: str) -> "tuple[str, str] | None":
+def _open_close(entity) -> "tuple[str, str] | None":
     etype = entity.type
     simple = _SIMPLE_TAGS.get(etype)
     if simple:
@@ -87,7 +87,7 @@ def entities_to_html(text: str, entities, offset: int = 0) -> str:
         start, end = entity.offset, entity.offset + entity.length
         if end <= offset or start > total:
             continue
-        pair = _open_close(entity, "")
+        pair = _open_close(entity)
         if not pair:
             continue
         open_tag, close_tag = pair

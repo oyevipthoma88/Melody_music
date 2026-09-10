@@ -1,7 +1,7 @@
 # ════════════════════════════════════════════════════════════
 #   𝙈𝙚𝙡𝙤𝙙𝙞𝙓 🎧  —  Docker Image
-#   Owner  : @TheY_CaIl_mE_OG
-#   Bot    : @MelodiXMusic_Bot
+#   Owner  : @oyevipthoma88
+#   Bot    : @YourMelodyBot
 # ════════════════════════════════════════════════════════════
 
 FROM nikolaik/python-nodejs:python3.10-nodejs18
@@ -22,6 +22,13 @@ WORKDIR /app/
 # Install Python dependencies
 RUN pip3 install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir --upgrade --requirement requirements.txt
+
+# heroku.yml deploys this repository through the Dockerfile, so Heroku's
+# buildpack `bin/post_compile` hook is not invoked automatically. Without
+# this explicit bootstrap the image ships without Deno/bgutil PO-token
+# support and static ffmpeg, causing YouTube direct resolution and the local
+# fallback downloader to fail together on cloud IPs.
+RUN bash /app/bin/post_compile /app
 
 # Start bot
 CMD bash start

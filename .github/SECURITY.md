@@ -2,7 +2,7 @@
 
 ## Reporting a Vulnerability
 
-If there are any vulnerabilities in **MelodiXMusicBot**, don't hesitate to _report them_.
+If there are any vulnerabilities in **Melody Music**, don't hesitate to _report them_.
 
 1. Use any of the [private contact addresses](the project support section).
 2. Describe the vulnerability.

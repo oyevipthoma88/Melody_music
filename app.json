@@ -46,7 +46,7 @@
     },
     "BOT_USERNAME": {
       "description": "Your bot's username e.g. @YourMelodyBot",
-      "value": "@MelodiXMusic_Bot",
+      "value": "@YourMelodyBot",
       "required": false
     },
     "GENIUS_API_TOKEN": {

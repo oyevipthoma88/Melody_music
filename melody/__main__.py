@@ -197,6 +197,11 @@ async def register_slash_commands(bot):
         BotCommand("settings",  "🎚 Turn any filter on / off (admins)"),
         BotCommand("approve",   "✅ Ignore a user in all filters (admins)"),
         BotCommand("unapprove", "🚫 Stop ignoring a user (admins)"),
+        BotCommand("approverequest", "✅ Accept one join request"),
+        BotCommand("declinerequest", "❌ Decline one join request"),
+        BotCommand("rpending", "📋 List pending join requests"),
+        BotCommand("rapproveall", "✅ Accept all join requests"),
+        BotCommand("rdeclineall", "❌ Decline all join requests"),
         BotCommand("help",      "📖 Help menu"),
         # Economy — persistent, non-gambling group game
         BotCommand("balance",   "🪙 Wallet, bank, level and coins"),
@@ -371,18 +376,33 @@ async def register_slash_commands(bot):
         ]
         private_commands = []
 
+    async def _set_commands_safely(commands, scope, label):
+        """Register a menu and recover from Telegram's per-scope limit."""
+        try:
+            await bot.set_bot_commands(commands, scope=scope)
+        except Exception as exc:
+            if "BOT_COMMANDS_TOO_MUCH" not in str(exc):
+                raise
+            compact = commands[:100]
+            LOGGER.warning(
+                "Command menu %s has %d entries; retrying with 100-entry menu",
+                label, len(commands),
+            )
+            await bot.set_bot_commands(compact, scope=scope)
+
     try:
-        await bot.set_bot_commands(group_commands, scope=BotCommandScopeAllGroupChats())
-        await bot.set_bot_commands(private_commands, scope=BotCommandScopeAllPrivateChats())
+        await _set_commands_safely(group_commands, BotCommandScopeAllGroupChats(), "groups")
+        await _set_commands_safely(private_commands, BotCommandScopeAllPrivateChats(), "private")
         if Config.OWNER_ID:
-            await bot.set_bot_commands(
+            await _set_commands_safely(
                 private_commands + owner_commands,
-                scope=BotCommandScopeChat(int(Config.OWNER_ID)),
+                BotCommandScopeChat(int(Config.OWNER_ID)),
+                "owner",
             )
         # Groups/private already have more specific scopes above, so the
         # default scope only applies where nothing else matches — i.e.
         # channels, which Pyrogram/Telegram has no dedicated scope for.
-        await bot.set_bot_commands(channel_commands, scope=BotCommandScopeDefault())
+        await _set_commands_safely(channel_commands, BotCommandScopeDefault(), "default")
         LOGGER.info(
             "Slash commands registered: %d group, %d private, %d owner, %d channel",
             len(group_commands), len(private_commands), len(owner_commands),
@@ -574,6 +594,17 @@ async def main():
     except Exception as exc:
         LOGGER.warning("ffmpeg runtime check failed: %s", exc)
 
+    # ⚡ SPEED FIX: Eagerly warm bgutil PO-token HTTP server at boot.
+    # Lazily starting it on the first /play forced users to wait 4-6s
+    # for Deno to boot + server init, directly causing the playback delay.
+    try:
+        from melody.core.ytdl import ensure_bgutil_http_server, _wait_for_bgutil_http
+        await asyncio.to_thread(ensure_bgutil_http_server)
+        await asyncio.to_thread(_wait_for_bgutil_http, 15.0)
+        LOGGER.info("✅ bgutil PO-token HTTP server warmed up at boot")
+    except Exception as exc:
+        LOGGER.warning("bgutil HTTP server eager start failed: %s", exc)
+
     # FIX: restore GitHub-persisted images (start pic, group-welcome pic)
     # BEFORE plugins load. Ephemeral filesystems (Heroku) wipe assets/ on
     # every restart; /setpic and /setwelcomepic push to GitHub on save, but
@@ -681,6 +712,9 @@ async def main():
         try:
             await start_call_py()
             LOGGER.info("PyTgCalls started.")
+            from melody.core import vc_listener
+            vc_listener.start()
+            LOGGER.info("VC listener watchdog started.")
         except Exception as exc:  # noqa: BLE001
             assistant_ok = False
             _melody_pkg.ASSISTANT_READY = False

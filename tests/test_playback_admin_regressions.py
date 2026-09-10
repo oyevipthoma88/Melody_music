@@ -15,6 +15,26 @@ def test_ytdl_disables_implicit_ffmpeg_fixups():
     assert "Recovered completed download after temp rename race" in source
 
 
+def test_docker_deploy_runs_post_compile_runtime_bootstrap():
+    source = _source("Dockerfile")
+    assert "RUN bash /app/bin/post_compile /app" in source
+    assert "Deno/bgutil PO-token" in source
+
+
+def test_bgutil_health_flag_recovers_after_provider_process_exit():
+    source = _source("melody/core/ytdl.py")
+    assert "provider process is not alive" in source
+    assert 'def _bgutil_http_alive()' in source
+    health_fn = source[source.index('def _bgutil_http_alive()'):source.index('async def warm_up_bgutil_server(')]
+    assert 'global _BGUTIL_HTTP_PROC' in health_fn
+    assert "if _BGUTIL_HTTP_PROC is not None and _BGUTIL_HTTP_PROC.poll() is None" in source
+    assert "_BGUTIL_HTTP_READY = False" in source
+    assert "PO-token server stopped" in source
+    assert "server became unresponsive — restarting it" in source
+    assert "proc.terminate()" in source
+    assert "http://127.0.0.1:{_BGUTIL_HTTP_PORT}/ping" in source
+
+
 def test_no_result_is_not_reported_as_a_crash_or_fake_video_id():
     source = _source("melody/core/ytdl.py")
     assert 'context={"video_id": f"ytsearch1:{url_or_query}"' not in source
@@ -42,14 +62,35 @@ def test_fast_path_does_not_cancel_unstarted_ytdlp_future():
     assert "_meta_cache_put(cache_key, result)" in source
 
 
-def test_permanent_youtube_download_errors_skip_retry_ladder():
+def test_client_specific_format_errors_continue_retry_ladder():
     source = _source("melody/core/ytdl.py")
     assert "_PERMANENT_DOWNLOAD_MARKERS" in source
     assert "no video formats found" in source
     assert "drm protected" in source
-    assert "requested format is not available" in source
+    assert '"requested format is not available"' not in source
+    assert "Format availability is client/rung-specific" in source
     assert "_is_permanent_download_error(exc)" in source
     assert "skipping remaining fallback clients" in source
+
+
+def test_http_forbidden_downloads_remain_retryable_across_clients():
+    source = _source("melody/core/ytdl.py")
+    # A cloud CDN may reject one signed URL/client with 403; the retry ladder
+    # must reach alternate YouTube clients instead of aborting on the first rung.
+    assert '"http error 403"' not in source
+    assert '"http error 429"' not in source
+    assert '"sign in to confirm you’re not a bot"' not in source
+    assert '"_client": ["android_music", "android", "android_vr"]' in source
+    assert '"_client": ["ios", "ios_music", "mweb"]' in source
+
+
+def test_expected_vc_permission_errors_do_not_reach_owner_error_log():
+    source = _source("melody/core/call.py")
+    assert "Expected Telegram access/permission failure" in source
+    assert "Permission is already explained in the GC" in source
+    assert "_playback_notice_until" in source
+    assert "_PLAYBACK_NOTICE_TTL = 60.0" in source
+    assert "if deadline > now:" in source
 
 
 def test_remote_probe_preserves_stream_headers():
@@ -66,9 +107,10 @@ def test_cdn_probe_prefers_curl_cffi_with_urllib_fallback():
     assert "retain urllib as a dependency-free" in source
 
 
-def test_youtube_client_policy_avoids_web_first_sabr_selection():
+def test_youtube_client_policy_keeps_cloud_direct_fallback_order():
     source = _source("melody/core/ytdl.py")
-    assert '"player_client": ["tv", "ios", "web_safari"]' in source
+    assert '"player_client": ["web_safari", "default", "ios"]' in source
+    assert '"player_client": ["android_music", "android_vr", "tv", "ios", "web_safari"]' not in source
     assert '"client": client_name' in source
     assert '"User-Agent": ua' in source
 
@@ -131,9 +173,9 @@ def test_early_audio_paths_never_persist_until_download_completion():
     call = _source("melody/core/call.py")
     assert 'if is_download_inflight(track.video_id, audio_only=not video):' in call
     assert 'completed = await wait_for_download(' in call
-    assert 'elif filepath and not filepath.endswith(".early"):' in call
-    assert 'cache_flag = os.getenv("MONGO_AUDIO_CACHE", "true")' in call
-    assert 'cache_flag = os.getenv("MONGO_GRIDFS_CACHE", "false")' in call
+    assert 'await _persist_completed_song(archived_path, track)' in call
+    assert 'from utils.telegram_archive import archive_completed_file' in call
+    assert 'Archive completed fallback media in Telegram' in call
 
 
 def test_fallback_vc_admin_error_is_caught_before_generic_crash_logging():
@@ -170,11 +212,29 @@ def test_interactive_downloads_outrank_autoplay_prefetch():
     assert "priority=_FORCE_DOWNLOAD_PRIORITY" in call
     assert "candidates = [" in call
     assert "candidates[:prefetch_workers]" in call
-    assert "await _persist_completed_song(path, upcoming)" in call
+    assert "await _persist_completed_song(path, upcoming)" in autoplay
     assert "if is_download_cancelled(exc):" in call
     assert "fut.add_done_callback(_consume_download_future)" in ytdl
     assert "cancel_lower_priority_downloads(" in _source("melody/plugins/music/play.py")
     assert "exclude_video_id=direct_id" in _source("melody/plugins/music/play.py")
+    assert 'PREFETCH_ENABLED", "true"' in call
+    assert 'RESOLVE_TIMEOUT", "4.0"' in ytdl
+    assert 'INNERTUBE_HEADSTART", "0.20"' in ytdl
+    assert 're.sub(r"\\.part-frag\\d+$", "", name)' in ytdl
+    assert 'picked = _pick_stream_formats(result, want_video)' in ytdl
+    assert 'result["_picked"] = picked' in ytdl
+    assert '_innertube_streams_sync(video_id, want_video=want_video)' in ytdl
+    config = _source("melody/config.py")
+    assert '_env_bool("BGUTIL_STARTUP_WARMUP", True)' in config
+
+
+def test_atlas_quota_cannot_break_autoplay_persistence():
+    database = _source("utils/database.py")
+    assert "_STORAGE_WRITES_DISABLED = False" in database
+    assert "def _is_storage_quota_error" in database
+    assert "async def add_history" in database
+    assert "if _STORAGE_WRITES_DISABLED:" in database
+    assert '"writes are blocked" in text' in database
 
 
 def test_fresh_log_network_and_autoplay_races_are_single_flight():
@@ -282,7 +342,8 @@ def test_stale_download_cancellation_is_owner_scoped_and_cooperative():
     assert "class _DownloadCancelled" in ytdl
     assert "raise _DownloadCancelled" in ytdl
     assert "cancel_download(previous[0], audio_only=not previous[1], owner=chat_id)" in call
-    assert "Do NOT cancel the asyncio wrapper" in call
+    assert "retained as a cache warmer" in call
+    assert "download_task.add_done_callback(_consume_task_exception)" in call
     assert "if is_download_cancelled(exc):" in call
     assert "_get_stream_commit_lock(chat_id)" in call
 
@@ -328,7 +389,7 @@ def test_startup_recovery_and_peer_warmup_cannot_block_commands():
     config = _source("melody/config.py")
     assert "PLAYBACK_RECOVERY: bool = _env_bool(\"PLAYBACK_RECOVERY\", False)" in config
     assert "spawn(_recover_in_background())" in main
-    assert "spawn(warm_bot_peer_cache(bot), name=\"bot-peer-warm\")" in main
+    assert "warm_recovery_peers" in main
     assert "await warm_bot_peer_cache(bot)" not in main
     assert "spawn(_finish_secondary_startup(), name=\"startup-log-sync\")" in main
 
@@ -422,7 +483,7 @@ def test_cold_audio_fallback_prefers_small_voice_chat_format():
     source = _source("melody/core/ytdl.py")
     assert 'YT_AUDIO_MAX_ABR' in source
     assert 'bestaudio[ext=webm][abr<=' in source
-    assert 'bestaudio[ext=opus]/bestaudio[abr<=128]' in source
+    assert 'bestaudio[ext=opus]/bestaudio[abr<=192]' in source
     assert '"concurrent_fragment_downloads": _env_int("YT_CONCURRENT_FRAGMENTS", 4)' in source
 
 
@@ -463,3 +524,42 @@ def test_range_proxy_range_parser_is_bounded():
     assert _parse_range("bytes=0-9", 100) == (0, 9)
     assert _parse_range("bytes=90-", 100) == (90, 99)
     assert _parse_range("bytes=-10", 100) == (90, 99)
+
+
+def test_telegram_loopback_proxy_is_classified_as_local_source():
+    from utils.pytgcalls_patch import _is_local_proxy_url, _is_local_source
+
+    proxy = "http://127.0.0.1:43127/tg/token/movie.mp4"
+    assert _is_local_proxy_url(proxy)
+    assert _is_local_source(proxy)
+    assert not _is_local_proxy_url("https://cdn.example.com/movie.mp4")
+
+
+def test_loopback_proxy_probe_path_does_not_require_remote_probe_error():
+    source = _source("utils/pytgcalls_patch.py")
+    assert "local = _is_local_source(path)" in source
+    assert "if _is_local_file(path) and not _is_local_playable(path)" in source
+    assert "raise StreamProbeUnavailable" in source
+
+
+def test_local_telegram_proxy_bypasses_ffprobe_before_pytgcalls():
+    source = _source("utils/pytgcalls_patch.py")
+    assert "if _is_local_proxy_url(path):" in source
+    assert "local Telegram proxy — skipping pre-probe" in source
+    assert "return None" in source[source.index("if _is_local_proxy_url(path):"):source.index("# PERMANENT FIX", source.index("if _is_local_proxy_url(path):"))]
+
+
+def test_large_movie_proxy_has_bounded_high_fanout_registry():
+    source = _source("utils/tg_media_proxy.py")
+    assert '_MAX_PROXIES = _env_int("TG_PROXY_MAX_ENTRIES", 1024, 64)' in source
+    assert '_PROXY_CONCURRENCY = _env_int("TG_PROXY_CONCURRENCY", 32, 4)' in source
+    assert "_source_tokens" in source
+    assert "same movie" in source
+    assert "_stream_slots = asyncio.Semaphore(_PROXY_CONCURRENCY)" in source
+
+
+def test_command_registration_recovers_from_telegram_command_limit():
+    source = _source("melody/__main__.py")
+    assert "BOT_COMMANDS_TOO_MUCH" in source
+    assert "retrying with 100-entry menu" in source
+    assert "_set_commands_safely" in source

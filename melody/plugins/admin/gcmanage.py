@@ -23,6 +23,7 @@ from pyrogram.types import CallbackQuery, ChatPermissions, Message
 
 from melody import bot
 from melody.config import Config
+from utils.client_cache import get_me_cached
 from melody.logging import log_activity
 from utils.admin_tools import (
     BASIC_PRIVILEGES,
@@ -319,7 +320,7 @@ async def _promote_sanity(client: Client, message: Message, user, action: str) -
             )
 
     try:
-        me = await client.get_me()
+        me = await get_me_cached(client)
         if user.id == me.id:
             return "🎶 <b>Mujhe hi ?</b> Apne aap ko promote/demote nahi karta 😌"
     except Exception:
@@ -383,7 +384,7 @@ async def _grantable(client: Client, chat_id: int, wanted,
 
     mine = None
     try:
-        me = await client.get_me()
+        me = await get_me_cached(client)
         member = await client.get_chat_member(chat_id, me.id)
         mine = getattr(member, "privileges", None)
     except Exception:

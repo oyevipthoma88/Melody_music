@@ -5,10 +5,8 @@ FIX: format_queue() now returns HTML (not Markdown) so queue_cmd.py can
      send it with parse_mode=HTML and avoid ENTITY_BOUNDS_INVALID when song
      titles contain Markdown special characters (* _ ` [ etc.).
 """
-import asyncio
 import html
 import random
-import weakref
 from dataclasses import dataclass, fields
 from typing import Optional
 from utils.database import get_setting, set_setting
@@ -38,8 +36,8 @@ class Track:
     # Storing the intent on the Track itself makes it survive being queued,
     # popped, looped, or replayed by AutoPlay.
     video: bool = False
-    # Original text query, retained so a failed top YouTube hit can be replaced
-    # with the next streamable candidate without losing the user's intent.
+    # Preserve the original text query so an unavailable top search hit can
+    # be replaced with the next streamable candidate during playback.
     source_query: str = ""
 
 
@@ -49,27 +47,19 @@ _current: dict[int, Track] = {}
 _loop: dict[int, str] = {}       # "none" | "single" | "all"
 _volume: dict[int, int] = {}     # 0-200 (0 = muted)
 _predownloaded: dict[int, Track] = {}  # chat_id -> next AutoPlay track, already cached to /tmp
-_persist_locks = weakref.WeakValueDictionary()
+_autoplay_generation: dict[int, int] = {}
 
 
-async def _save_snapshot_ordered(lock, chat_id, current, queue, loop, volume):
-    async with lock:
-        from utils.playback_state import save_snapshot
-        await save_snapshot(chat_id, current, queue, loop, volume)
+def autoplay_generation(chat_id: int) -> int:
+    return _autoplay_generation.get(chat_id, 0)
 
 
 def _persist(chat_id: int) -> None:
     """Persist mutations without putting Mongo latency on playback's hot path."""
     try:
-        lock = _persist_locks.get(chat_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _persist_locks[chat_id] = lock
-        # Copy the queue at submission time. The per-chat lock preserves
-        # mutation order, preventing an older async write from landing after a
-        # later /clear or /skip and resurrecting stale playback state.
-        spawn(_save_snapshot_ordered(
-            lock, chat_id, _current.get(chat_id), list(_queues.get(chat_id, [])),
+        from utils.playback_state import save_snapshot
+        spawn(save_snapshot(
+            chat_id, _current.get(chat_id), _queues.get(chat_id, []),
             _loop.get(chat_id, "none"), _volume.get(chat_id, 100),
         ))
     except RuntimeError:
@@ -96,23 +86,27 @@ def _track_from_dict(data) -> Optional[Track]:
 
 
 def restore_snapshot(snapshot: dict) -> None:
-    """Restore one validated Mongo snapshot into the in-memory state."""
-    chat_id = int(snapshot["chat_id"])
-    current = snapshot.get("current")
+    """Restore one validated Mongo snapshot into the in-memory state.
+
+    Snapshots can outlive a deploy and may be partially written. Invalid or
+    missing fields are ignored instead of leaving stale playback state or
+    crashing startup recovery.
+    """
+    if not isinstance(snapshot, dict):
+        return
+    try:
+        chat_id = int(snapshot["chat_id"])
+    except (KeyError, TypeError, ValueError):
+        return
+    restored = _track_from_dict(snapshot.get("current"))
+    if restored is not None:
+        _current[chat_id] = restored
+    else:
+        _current.pop(chat_id, None)
     queue = snapshot.get("queue") or []
-    # A restore can run more than once during reconnect/recovery. Remove old
-    # state first; otherwise a snapshot with no current track resurrects the
-    # previous track and a malformed volume value can abort the whole restore.
-    _current.pop(chat_id, None)
-    if current:
-        restored = _track_from_dict(current)
-        if restored is not None:
-            _current[chat_id] = restored
     _queues[chat_id] = [t for t in (_track_from_dict(i) for i in queue) if t]
-    mode = snapshot.get("loop", "none")
-    _loop[chat_id] = mode if isinstance(mode, str) and mode in {
-        "none", "single", "all"
-    } else "none"
+    mode = str(snapshot.get("loop", "none")).lower()
+    _loop[chat_id] = mode if mode in {"none", "single", "all"} else "none"
     try:
         volume = int(snapshot.get("volume", 100))
     except (TypeError, ValueError):
@@ -187,10 +181,6 @@ def active_video_ids() -> set[str]:
 def clear_queue(chat_id: int, persist: bool = True):
     _queues[chat_id] = []
     _current.pop(chat_id, None)
-    # A predownloaded AutoPlay track belongs to the old queue/session. Keeping
-    # it here made /stop or /clear followed by a new /play unexpectedly start
-    # stale audio, and also kept its media protected from cache eviction.
-    _predownloaded.pop(chat_id, None)
     if persist:
         _persist(chat_id)
 
@@ -227,8 +217,9 @@ def shuffle_queue(chat_id: int):
 # ─── Loop ────────────────────────────────────────────────────────────────────
 
 def set_loop(chat_id: int, mode: str):
-    """mode: 'none' | 'single' | 'all'"""
-    _loop[chat_id] = mode
+    """Set a validated loop mode: ``none``, ``single`` or ``all``."""
+    normalized = str(mode or "none").lower()
+    _loop[chat_id] = normalized if normalized in {"none", "single", "all"} else "none"
     _persist(chat_id)
 
 
@@ -243,8 +234,12 @@ def get_volume(chat_id: int) -> int:
 
 
 def set_volume_local(chat_id: int, vol: int):
-    # Allow 0 (mute) up to 200
-    _volume[chat_id] = max(0, min(200, vol))
+    # Allow 0 (mute) up to 200; malformed input falls back to a safe value.
+    try:
+        value = int(vol)
+    except (TypeError, ValueError):
+        value = 100
+    _volume[chat_id] = max(0, min(200, value))
     _persist(chat_id)
 
 
@@ -344,6 +339,7 @@ async def is_autoplay_on(chat_id: int) -> bool:
 async def set_autoplay(chat_id: int, enabled: bool):
     import time as _time
 
+    _autoplay_generation[chat_id] = autoplay_generation(chat_id) + 1
     await set_setting(chat_id, "autoplay", enabled)
     # Remember WHEN it was switched off so it can auto-heal 30 min later.
     await set_setting(chat_id, "autoplay_off_at", 0 if enabled else _time.time())

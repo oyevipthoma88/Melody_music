@@ -68,7 +68,7 @@ async def _delete_chunk(client: Client, chat_id: int, ids: list[int], depth: int
     """Delete a list of ids, splitting on failure so ONE bad id can't skip 99 good ones."""
     if not ids:
         return 0
-    for attempt in range(3):
+    for _attempt in range(3):
         try:
             removed = await client.delete_messages(chat_id, ids)
             # Some forks return a bool / None instead of a count.
@@ -383,7 +383,7 @@ def _is_service_msg(msg) -> bool:
     return bool(getattr(msg, "service", None))
 
 
-def _matches_mode(msg, mode: str, me_id: int) -> bool:
+def _matches_mode(msg, mode: str) -> bool:
     from_user = getattr(msg, "from_user", None)
     is_bot = bool(from_user and getattr(from_user, "is_bot", False))
     if mode == "all":
@@ -434,7 +434,6 @@ async def clean_cmd(client: Client, message: Message):
     )
 
     try:
-        me = await client.get_me()
         ids = list(range(max(message.id - limit, 1), message.id + 1))
         targets: list[int] = [message.id]  # the /clean command itself
         scanned = 0
@@ -457,7 +456,7 @@ async def clean_cmd(client: Client, message: Message):
                 if msg.id in (status.id, message.id):
                     continue
                 scanned += 1
-                if _matches_mode(msg, mode, me.id):
+                if _matches_mode(msg, mode):
                     targets.append(msg.id)
 
         deleted = 0

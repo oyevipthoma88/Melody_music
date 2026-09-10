@@ -22,6 +22,7 @@ class-level (once, at startup) so every call site benefits without edits.
 from __future__ import annotations
 
 import time
+import asyncio
 from typing import Any
 
 from melody.logging import LOGGER
@@ -80,7 +81,10 @@ def install_chat_cache() -> None:
         cached = _get(_chat_cache, key, CHAT_TTL)
         if cached is not None:
             return cached
-        result = await original_get_chat(self, chat_id, *args, **kwargs)
+        try:
+            result = await asyncio.wait_for(original_get_chat(self, chat_id, *args, **kwargs), timeout=5.0)
+        except asyncio.TimeoutError:
+            result = cached
         if result is not None:
             _put(_chat_cache, key, result)
         return result

@@ -51,6 +51,7 @@ from pyrogram.types import LinkPreviewOptions
 from utils.reply import reply_params
 
 from melody import bot
+from utils.client_cache import get_me_cached
 from melody.logging import LOGGER, log_activity
 from utils.admin_tools import auto_delete, card, close_kb, is_admin, mention
 from utils.buttons import ikb
@@ -83,7 +84,7 @@ _BUTTON_RE = re.compile(r"\[([^\[\]]+?)\]\(buttonurl://(.+?)(:same)?\)", re.IGNO
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _split_buttons(text: str) -> tuple[str, "InlineKeyboardMarkup | None"]:
+def _split_buttons(text: str) -> tuple[str, InlineKeyboardMarkup | None]:
     """Extract Rose-style [Label](buttonurl://url) buttons from the text."""
     rows: list[list] = []
     for label, url, same in _BUTTON_RE.findall(text):
@@ -96,7 +97,7 @@ def _split_buttons(text: str) -> tuple[str, "InlineKeyboardMarkup | None"]:
     return clean, (InlineKeyboardMarkup(rows) if rows else None)
 
 
-def _fill(template: str, user, chat, count: "int | None") -> str:
+def _fill(template: str, user, chat, count: int | None) -> str:
     first = html.escape(getattr(user, "first_name", None) or "User")
     last = html.escape(getattr(user, "last_name", None) or "")
     uname = f"@{user.username}" if getattr(user, "username", None) else first
@@ -118,7 +119,7 @@ def _fill(template: str, user, chat, count: "int | None") -> str:
     return out
 
 
-async def _member_count(client: Client, chat_id: int) -> "int | None":
+async def _member_count(client: Client, chat_id: int) -> int | None:
     try:
         return await client.get_chat_members_count(chat_id)
     except Exception:
@@ -143,7 +144,7 @@ def _arg(message: Message) -> str:
     return parts[1].strip().lower() if len(parts) > 1 else ""
 
 
-def _on_off(value: str) -> "bool | None":
+def _on_off(value: str) -> bool | None:
     if value in ("on", "yes", "true", "enable", "enabled", "1"):
         return True
     if value in ("off", "no", "false", "disable", "disabled", "0"):
@@ -177,7 +178,7 @@ async def _toggle_cmd(client: Client, message: Message, key: str, label: str):
 
 # ── the actual greeting sender ───────────────────────────────────────────────
 
-async def _send_greeting(client: Client, chat, user, kind: str, cfg: dict, reply_to: "int | None" = None):
+async def _send_greeting(client: Client, chat, user, kind: str, cfg: dict, reply_to: int | None = None):
     template = cfg.get(f"{kind}_text") or (DEFAULT_WELCOME if kind == "welcome" else DEFAULT_GOODBYE)
     count = await _member_count(client, chat.id)
     text, markup = _split_buttons(_fill(template, user, chat, count))
@@ -262,7 +263,7 @@ async def _send_greeting(client: Client, chat, user, kind: str, cfg: dict, reply
 @bot.on_message(filters.new_chat_members & filters.group, group=6)
 @error_handler
 async def on_join(client: Client, message: Message):
-    me = await client.get_me()
+    me = await get_me_cached(client)
     cfg = await get_greet(message.chat.id)
 
     if cfg.get("clean_service"):
@@ -289,7 +290,7 @@ async def on_join(client: Client, message: Message):
 @bot.on_message(filters.left_chat_member & filters.group, group=6)
 @error_handler
 async def on_left(client: Client, message: Message):
-    me = await client.get_me()
+    me = await get_me_cached(client)
     member = message.left_chat_member
     if not member or member.id == me.id or getattr(member, "is_bot", False):
         return

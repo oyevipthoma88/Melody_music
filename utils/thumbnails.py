@@ -21,6 +21,7 @@ import os
 import time
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont
+from utils.client_cache import get_me_cached
 
 ASSETS = os.path.join(os.path.dirname(__file__), "..", "assets")
 FONTS = os.path.join(ASSETS, "fonts")
@@ -128,7 +129,7 @@ async def get_bot_dp(client) -> "str | None":
         return _bot_dp_cache["path"]
     _bot_dp_cache["tried"] = True
     try:
-        me = await client.get_me()
+        me = await get_me_cached(client)
         path = await fetch_dp(client, me.id)
         _bot_dp_cache["path"] = path
         return path
@@ -148,7 +149,7 @@ async def get_bot_identity(client) -> tuple[str | None, str]:
         return _bot_identity_cache["username"], _bot_identity_cache["name"]
     _bot_identity_cache["tried"] = True
     try:
-        me = await client.get_me()
+        me = await get_me_cached(client)
         _bot_identity_cache["username"] = me.username
         _bot_identity_cache["name"] = me.first_name or "Melody"
     except Exception:

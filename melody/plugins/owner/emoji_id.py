@@ -74,7 +74,7 @@ async def emoji_id_cmd(client: Client, message: Message):
         resolvable = set()
 
     lines = ["🆔 <b>Real premium emoji ids found:</b>\n"]
-    for emoji_id, glyph in zip(ids, glyphs):
+    for emoji_id, glyph in zip(ids, glyphs, strict=False):
         status = "✅" if emoji_id in resolvable else "⚠️ not resolvable right now"
         lines.append(
             f"{status} <code>{glyph}</code> → "

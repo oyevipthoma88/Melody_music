@@ -15,6 +15,7 @@ import asyncio
 import html
 
 from pyrogram import Client, enums, filters
+from pyrogram.errors import FloodWait
 from pyrogram.types import Message
 
 from melody import bot
@@ -76,19 +77,73 @@ async def muteall_cmd(client: Client, message: Message):
     spawn(log_activity(f"#muteall #admin\n🏠 <code>{message.chat.id}</code> by <code>{message.from_user.id}</code>"))
 
 
+async def _restore_restricted_members(client: Client, chat_id: int) -> tuple[int, int]:
+    """Restore members that were individually restricted before /unmuteall.
+
+    set_chat_permissions() only changes the default permission template; it does
+    not undo restrict_chat_member() calls already stored on individual members.
+    Telegram may also return FloodWait while a large group is being repaired, so
+    this helper continues after per-user failures and reports the result.
+    """
+    restored = failed = 0
+    try:
+        async for member in client.get_chat_members(chat_id):
+            user = getattr(member, "user", None)
+            perms = getattr(member, "permissions", None)
+            status = str(getattr(member, "status", "")).lower()
+            if not user or getattr(user, "is_bot", False):
+                continue
+            if "restricted" not in status:
+                continue
+            if perms is not None and getattr(perms, "can_send_messages", True):
+                continue
+            for attempt in range(3):
+                try:
+                    await client.restrict_chat_member(
+                        chat_id, user.id, permissions=UNMUTED_PERMS
+                    )
+                    restored += 1
+                    break
+                except FloodWait as fw:
+                    await asyncio.sleep(int(getattr(fw, "value", getattr(fw, "x", 2))) + 1)
+                except Exception:
+                    if attempt == 2:
+                        failed += 1
+                    else:
+                        await asyncio.sleep(0.5)
+            if (restored + failed) % 20 == 0:
+                await asyncio.sleep(1)
+    except Exception:
+        # The default permission change still succeeded; the caller surfaces
+        # this as a partial result instead of making /unmuteall look successful.
+        failed += 1
+    return restored, failed
+
+
 @bot.on_message(filters.command("unmuteall") & filters.group)
 @error_handler
 async def unmuteall_cmd(client: Client, message: Message):
     if not await _owner_gate(client, message):
         return
     ok, err = await safe_call(client.set_chat_permissions(message.chat.id, UNMUTED_PERMS))
+    restored, failed = await _restore_restricted_members(client, message.chat.id)
     await set_setting_flag(message.chat.id, "muteall", False)
+    detail = (
+        "🔈 <b>Group khul gaya</b> — sab bol sakte hain 🎶\n"
+        f"👥 <b>Existing muted users restored:</b> <code>{restored}</code>"
+    )
+    if failed:
+        detail += f"\n⚠️ <b>Could not restore:</b> <code>{failed}</code>"
+    if not ok:
+        detail += f"\n⚠️ <code>{html.escape(str(err))}</code>"
     await message.reply(
-        card("Uɴᴍᴜᴛᴇ Aʟʟ", "🔈 <b>Group khul gaya</b> — sab bol sakte hain 🎶" + ("" if ok else f"\n⚠️ <code>{err}</code>")),
+        card("Uɴᴍᴜᴛᴇ Aʟʟ", detail),
         parse_mode=enums.ParseMode.HTML,
         reply_markup=close_kb(),
     )
-    spawn(log_activity(f"#unmuteall #admin\n🏠 <code>{message.chat.id}</code>"))
+    spawn(log_activity(
+        f"#unmuteall #admin\n🏠 <code>{message.chat.id}</code> · restored <code>{restored}</code>"
+    ))
 
 
 @bot.on_message(filters.command("banall") & filters.group)

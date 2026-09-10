@@ -137,7 +137,17 @@ def sweep(aggressive: bool = False) -> int:
     for pattern in (*PARTIAL_GLOBS, STAGING_GLOB):
         for f in glob.glob(pattern):
             try:
-                if os.path.isfile(f) and os.path.getmtime(f) < stale_cutoff:
+                if os.path.getmtime(f) >= stale_cutoff:
+                    continue
+                if os.path.isdir(f) and os.path.basename(f).startswith("yt_"):
+                    size = sum(
+                        os.path.getsize(p)
+                        for p in glob.glob(os.path.join(f, "**", "*"), recursive=True)
+                        if os.path.isfile(p)
+                    )
+                    shutil.rmtree(f, ignore_errors=True)
+                    reclaimed += size
+                elif os.path.isfile(f):
                     reclaimed += _unlink(f)
             except OSError:
                 pass
@@ -154,7 +164,7 @@ def sweep(aggressive: bool = False) -> int:
         limit = min(limit, 16 * 1024 * 1024)
 
     files.sort(key=lambda x: x[1])  # oldest touched first
-    for path, mtime, size in files:
+    for path, mtime, _size in files:
         if total <= limit:
             break
         if now - mtime < _MIN_AGE_SECONDS:
@@ -178,7 +188,18 @@ def boot_sweep() -> int:
     reclaimed = 0
     for pattern in (*PARTIAL_GLOBS, STAGING_GLOB):
         for f in glob.glob(pattern):
-            reclaimed += _unlink(f)
+            try:
+                if os.path.isdir(f) and os.path.basename(f).startswith("yt_"):
+                    reclaimed += sum(
+                        os.path.getsize(p)
+                        for p in glob.glob(os.path.join(f, "**", "*"), recursive=True)
+                        if os.path.isfile(p)
+                    )
+                    shutil.rmtree(f, ignore_errors=True)
+                else:
+                    reclaimed += _unlink(f)
+            except OSError:
+                pass
     reclaimed += sweep()
     return reclaimed
 
