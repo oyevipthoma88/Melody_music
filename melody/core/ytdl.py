@@ -125,6 +125,24 @@ except ValueError:
 # latency that urllib.request paid on every single call.
 import httpx as _httpx
 
+
+class _NoStoreCookies(_httpx.Cookies):
+    """Cookie jar that NEVER stores Set-Cookie from responses.
+
+    SPEED ROOT CAUSE (Sep 10 log: `IOS -> LOGIN_REQUIRED`,
+    `ANDROID_VR -> LOGIN_REQUIRED` on every /play): the pooled httpx client
+    kept the cookies YouTube handed back to the *authenticated web* probes and
+    then replayed them on the mobile InnerTube probes. The mobile clients are
+    cookie-less by design — a logged-in session on them makes YouTube answer
+    "Sign in to confirm you're not a bot", which killed the 0.3s fast path and
+    forced the 5-7s yt-dlp resolve for every single song. Cookies are attached
+    explicitly per request (web family only); nothing is ever remembered.
+    """
+
+    def extract_cookies(self, response) -> None:  # noqa: D102, ANN001
+        return
+
+
 _http_client: "_httpx.AsyncClient | None" = None
 _http_client_lock = asyncio.Lock()
 _http_sync_client: "_httpx.Client | None" = None
@@ -159,6 +177,9 @@ def _http_client_kwargs() -> dict:
         "limits": _httpx.Limits(max_connections=20, max_keepalive_connections=10),
         "headers": {"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"},
         "follow_redirects": True,
+        # See _NoStoreCookies: cross-client cookie bleed is what turned every
+        # InnerTube probe into LOGIN_REQUIRED.
+        "cookies": _NoStoreCookies(),
     }
     return kwargs
 
@@ -4610,21 +4631,32 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
     _WEB_FAMILY = ("TVHTML5", "MWEB", "WEB", "WEB_EMBEDDED_PLAYER",
                    "WEB_REMIX", "TVHTML5_SIMPLY_EMBEDDED_PLAYER")
     cookie_header = _innertube_cookie_header()
-    if not cookie_header:
-        _CLIENTS = [c for c in _CLIENTS if c[0] not in _WEB_FAMILY]
 
-    # SPEED FIX: with a real session available, ask the clients that actually
-    # answer OK from a datacenter IP and keep the fan-out small (the thread
-    # pool is shared with search + downloads, so 7 dead probes per track also
-    # queued useful work behind them).
-    session = _innertube_session() if cookie_header else {"visitor": "", "pot": ""}
-    if session.get("visitor"):
-        _CLIENTS = [
-            ("WEB_EMBEDDED_PLAYER", "1.20250606.01.00", _IT_WEB_UA, {}),
-            ("TVHTML5_SIMPLY_EMBEDDED_PLAYER", "2.0", _IT_WEB_UA, {}),
-            ("WEB_REMIX", "1.20250602.01.00", _IT_WEB_UA, {}),
-            ("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {}),
-        ] + [c for c in _CLIENTS if c[0] in ("IOS", "ANDROID_VR")]
+    # SPEED FIX — LIVE-VERIFIED from a datacenter IP (Sep 10 2026), the exact
+    # environment this bot runs in:
+    #   IOS      -> OK in 0.17s, 23 unciphered googlevideo URLs (206 on fetch)
+    #   ANDROID  -> OK in 0.12s, 26 unciphered URLs (206 on fetch)
+    #   WEB / WEB_REMIX          -> UNPLAYABLE ("Video unavailable")
+    #   MWEB                     -> UNPLAYABLE ("The page needs to be reloaded")
+    #   TVHTML5 / ANDROID_VR     -> LOGIN_REQUIRED ("confirm you're not a bot")
+    #   *_EMBEDDED_PLAYER        -> ERROR ("no longer supported in this app")
+    # So the web family cannot win, it can only cost time: in the Sep 10 log
+    # four dead web probes ran first and /play still paid the 4.8s yt-dlp
+    # resolve. They are off the critical path now (opt back in with
+    # INNERTUBE_WEB_CLIENTS=true), and the cookie-less mobile clients — which
+    # need no visitorData, no PO token and no session round-trips — go first.
+    _MOBILE_ORDER = ("IOS", "ANDROID", "ANDROID_MUSIC", "IOS_MUSIC", "ANDROID_VR")
+    _by_name = {c[0]: c for c in _CLIENTS}
+    _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name]
+
+    session = {"visitor": "", "pot": ""}
+    if cookie_header and _env_flag("INNERTUBE_WEB_CLIENTS", False):
+        session = _innertube_session()
+        if session.get("visitor"):
+            _CLIENTS = _CLIENTS + [
+                ("WEB_REMIX", "1.20250602.01.00", _IT_WEB_UA, {}),
+                ("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {}),
+            ]
 
     def _probe(entry):
         client_name, client_ver, ua, extra = entry
@@ -4685,7 +4717,11 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
             # UNPLAYABLE the direct path silently dies and every song falls
             # back to a full download. That is exactly the "gana late bajta
             # hai" symptom, and the logs used to show nothing about it.
-            LOGGER.info("#stream innertube %s for %s -> %s", client_name, video_id, status or "?")
+            # Log the reason too — "LOGIN_REQUIRED" alone hid whether the
+            # session was stale or the client itself is simply dead now.
+            LOGGER.info("#stream innertube %s for %s -> %s (%s)", client_name, video_id,
+                        status or "?",
+                        str((data.get("playabilityStatus") or {}).get("reason") or "")[:60])
             if status == "LOGIN_REQUIRED" and is_web:
                 # Refresh visitorData + PO token in the background so the next
                 # track gets a working session instead of muting the fast path.
