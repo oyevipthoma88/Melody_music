@@ -58,9 +58,9 @@ except Exception:  # noqa: BLE001
 # the cookie-authenticated yt-dlp path even gets a chance. Mute the host-level
 # InnerTube stream probe after consecutive failures and periodically re-test.
 try:
-    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "2")))
+    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "1")))
 except Exception:  # noqa: BLE001
-    _IT_MUTE_AFTER = 2
+    _IT_MUTE_AFTER = 1
 try:
     _IT_MUTE_TTL = max(60.0, float(os.getenv("INNERTUBE_MUTE_TTL", "900")))
 except Exception:  # noqa: BLE001
@@ -2916,6 +2916,55 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
     if early_event is not None:
         opts["progress_hooks"].append(_hook)
 
+    # ROOT-CAUSE FIX (Sep 10 log: "#download complete elapsed=9.33s" with the
+    # early handoff never firing): yt-dlp's progress hook is not a reliable
+    # signal on every rung/downloader. A tiny watcher thread polls the staging
+    # directory directly, so the growing WebM/Opus prefix is handed off as soon
+    # as it exists no matter which code path produced it.
+    _watch_stop = threading.Event()
+
+    def _watch_staging():
+        while not _watch_stop.wait(0.10):
+            if early_event is None or early_event.is_set():
+                return
+            try:
+                candidates = glob.glob(os.path.join(attempt_dir, "*"))
+            except OSError:
+                continue
+            for cand in candidates:
+                if not audio_only or not _early_audio_path_is_safe(cand):
+                    continue
+                try:
+                    size = os.path.getsize(cand)
+                except OSError:
+                    continue
+                if not _early_handoff_ready(size):
+                    continue
+                if early_holder is not None:
+                    stable = f"/tmp/melody_{video_id}_{tag}.early"
+                    try:
+                        link_tmp = f"{stable}.{os.getpid()}.tmp"
+                        if os.path.lexists(link_tmp):
+                            os.unlink(link_tmp)
+                        os.symlink(cand, link_tmp)
+                        os.replace(link_tmp, stable)
+                        early_holder["early_path"] = stable
+                    except OSError:
+                        early_holder["early_path"] = cand
+                LOGGER.info(
+                    "\u26a1 #download early audio handoff (watcher) %s variant=%s bytes=%d path=%s",
+                    video_id, tag, size, os.path.basename(cand),
+                )
+                early_event.set()
+                return
+
+    _watcher = None
+    if early_event is not None and audio_only:
+        _watcher = threading.Thread(
+            target=_watch_staging, daemon=True, name=f"melody-early-watch-{video_id[:8]}",
+        )
+        _watcher.start()
+
     try:
         try:
             info, filepath = _extract_with_retries(url, opts, audio_only)
@@ -2972,8 +3021,21 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
                 pass
         if early_holder is not None:
             early_holder["final_path"] = filepath
+        try:
+            LOGGER.info(
+                "#download file %s variant=%s ext=%s size=%d early=%s",
+                video_id, tag, filepath.rsplit(".", 1)[-1],
+                os.path.getsize(filepath),
+                bool(early_event is not None and early_event.is_set()),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return filepath
     finally:
+        try:
+            _watch_stop.set()
+        except Exception:  # noqa: BLE001
+            pass
         # Best-effort cleanup of this attempt's staging leftovers.
         try:
             import shutil as _shutil
