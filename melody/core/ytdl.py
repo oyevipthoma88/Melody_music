@@ -1317,6 +1317,11 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # force it for every protocol and never let ffmpeg download.
         "external_downloader": {"default": "native"},
         "hls_prefer_native": True,
+        # ⚡ 5-SECOND RULE (Sep 10 Heroku log: format_id=91, early=False,
+        # stream=10.16s): on cloud IPs YouTube often exposes ONLY HLS. Ask
+        # yt-dlp for an MPEG-TS output (self-describing packets, no index at
+        # EOF) so the growing file is playable long before it completes.
+        "hls_use_mpegts": _env_flag("HLS_USE_MPEGTS", True),
         "check_formats": False,
         # SPEED FIX ("gaana bajne me 8-9 sec"): these three extractions sit on
         # the critical path of every cold /play. Skipping playlist expansion,
@@ -2474,7 +2479,11 @@ _EARLY_HANDOFF_ENABLED = _env_flag("EARLY_HANDOFF", True)
 # can be consumed safely while yt-dlp keeps appending ordered clusters. Enable
 # this path on cloud hosts by default; video/MP4/M4A remain completion-only.
 _EARLY_AUDIO_HANDOFF_ENABLED = _env_flag("EARLY_AUDIO_HANDOFF", True)
-_EARLY_AUDIO_STREAMABLE_EXTS = {"webm", "ogg", "oga", "opus", "mp3", "flac", "wav", "mka", "m4a"}
+_EARLY_AUDIO_STREAMABLE_EXTS = {
+    "webm", "ogg", "oga", "opus", "mp3", "flac", "wav", "mka", "m4a",
+    # MPEG-TS family (see hls_use_mpegts): prefix is immediately playable.
+    "ts", "mpegts", "m2ts", "aac",
+}
 # Extensions that are only early-handoff-safe when the moov atom sits at the
 # HEAD of the file (fragmented MP4). YouTube's audio-only m4a (itag 139/140/141)
 # is always fMP4 with the init segment first, so its prefix is playable; a
@@ -2501,10 +2510,30 @@ def _m4a_moov_at_head(path: str) -> bool:
     return b"moov" in head
 
 
+def _mpegts_at_head(path: str) -> bool:
+    """True when the file really is MPEG-TS, whatever its extension claims.
+
+    ROOT CAUSE of "early=False" on every HLS-only play: yt-dlp names an HLS
+    download ``.mp4`` even when its native downloader just concatenates MPEG-TS
+    segments, so the extension check rejected a growing file ffmpeg could have
+    opened right away and playback waited 8-9s for the full download.
+    MPEG-TS is unambiguous: 0x47 sync byte every 188 bytes.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(188 * 4)
+    except OSError:
+        return False
+    if len(head) < 188 * 2:
+        return False
+    return all(head[i] == 0x47 for i in range(0, len(head) - 187, 188))
+
+
 def _early_audio_file_is_safe(path: str) -> bool:
     """Path-based container check plus a moov-at-head sniff for m4a."""
     if not _early_audio_path_is_safe(path):
-        return False
+        # The extension lies on HLS extractions; trust the bytes instead.
+        return _mpegts_at_head(path)
     name = os.path.basename(path or "").lower()
     name = re.sub(r"\.part-frag\d+$", "", name)
     name = re.sub(r"\.frag\d+$", "", name)
