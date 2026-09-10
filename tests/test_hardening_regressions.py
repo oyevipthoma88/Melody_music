@@ -133,7 +133,7 @@ def test_natural_end_clears_current_track_state():
 
 def test_playback_source_race_has_absolute_start_budget():
     call = source("melody/core/call.py")
-    assert 'PLAY_START_BUDGET", "9.5"' in call
+    assert 'PLAY_START_BUDGET", "4.0"' in call
     assert "startup_deadline = time.monotonic() + _PLAY_START_BUDGET" in call
     assert "playback source startup budget exceeded" in call
     assert "fallback download exceeded startup budget" in call
