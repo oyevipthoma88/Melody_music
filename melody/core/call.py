@@ -1504,6 +1504,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             is_direct_url,
             is_tg_media_id,
             should_try_direct_stream,
+            direct_stream_muted,
             is_download_inflight,
             wait_for_download,
             wait_for_early_download,
@@ -1556,7 +1557,9 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             # Tagged Telegram media (synthetic "tg<chat>_<msg>" id) has no CDN
             # URL — racing the direct path only wastes the resolver timeout.
             direct_first = live_source or (
-                should_try_direct_stream() and not is_tg_media_id(track.video_id)
+                should_try_direct_stream()
+                and not direct_stream_muted()
+                and not is_tg_media_id(track.video_id)
             )
             if direct_first:
                 direct_task = asyncio.create_task(

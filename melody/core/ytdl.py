@@ -73,6 +73,11 @@ def _innertube_stream_muted() -> bool:
     return _it_stream_muted_until > _time_mod.monotonic()
 
 
+def direct_stream_muted() -> bool:
+    """Return whether this host should bypass the known-dead direct probe."""
+    return _innertube_stream_muted()
+
+
 def _note_innertube_stream(ok: bool) -> None:
     """Track consecutive host-level InnerTube direct-stream failures."""
     global _it_stream_fail_streak, _it_stream_muted_until
