@@ -109,3 +109,10 @@ def test_public_provider_failover_is_strictly_bounded():
     assert "_INVIDIOUS_INSTANCES[:_INVIDIOUS_MAX_INSTANCES]" in ytdl
     assert "timeout=0.75" in ytdl
     assert 'DIRECT_RESCUE_TIMEOUT", 1.5' in ytdl
+
+
+def test_cookie_stream_fast_path_uses_one_direct_web_client():
+    ytdl = source("melody/core/ytdl.py")
+    assert '["web_safari"]\n            if has_cookies' in ytdl
+    assert '_CLIENTS = [("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {})]' in ytdl
+    assert 'if cookie_header and _env_flag("INNERTUBE_WEB_CLIENTS", False)' not in ytdl

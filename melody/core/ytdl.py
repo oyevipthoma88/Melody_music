@@ -1337,7 +1337,10 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # host, which is why stream= stayed at 3.2-3.6s). With cookies
         # present, ask only the two cookie/PO-token clients that work here.
         "player_client": (
-            ["web_safari", "tv_simply"]
+            # A single cookie-authenticated web_safari player call is enough
+            # on this host.  Asking tv_simply as well made yt-dlp wait for a
+            # second player response even after web_safari had exposed HLS.
+            ["web_safari"]
             if has_cookies
             else ["web_safari", "android_vr", "default", "ios"]
         ),
@@ -4719,16 +4722,19 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
     # need no visitorData, no PO token and no session round-trips — go first.
     _MOBILE_ORDER = ("IOS", "ANDROID", "ANDROID_MUSIC", "IOS_MUSIC", "ANDROID_VR")
     _by_name = {c[0]: c for c in _CLIENTS}
-    _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name]
 
     session = {"visitor": "", "pot": ""}
-    if cookie_header and _env_flag("INNERTUBE_WEB_CLIENTS", False):
+    if cookie_header:
+        # SPEED FIX (Sep 11 production logs): all five anonymous mobile
+        # clients answer LOGIN_REQUIRED on this host.  A real YT_COOKIES
+        # session can ask WEB directly and often receives its HLS manifest in
+        # one player call (~300 ms), before the heavier yt-dlp fallback starts.
+        # Probe only WEB here: launching mobile and WEB_REMIX requests too
+        # merely competes for the small worker pool and repeats known failures.
         session = _innertube_session()
-        if session.get("visitor"):
-            _CLIENTS = _CLIENTS + [
-                ("WEB_REMIX", "1.20250602.01.00", _IT_WEB_UA, {}),
-                ("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {}),
-            ]
+        _CLIENTS = [("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {})]
+    else:
+        _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name]
 
     def _probe(entry):
         client_name, client_ver, ua, extra = entry
