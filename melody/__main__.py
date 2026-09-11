@@ -122,44 +122,6 @@ def load_plugins():
     return loaded, failed, failed_names
 
 
-async def warm_bot_peer_cache(bot):
-    """Pre-resolve known group peers for the bot client.
-
-    The bot account cannot call get_dialogs() (BOT_METHOD_INVALID), so after a
-    restart its local peer cache is empty and Pyrogram can drop updates from
-    groups with "Peer id invalid" before our handlers run. resolve_peer() IS
-    allowed for chats we already stored in Mongo, so warm those.
-    """
-    from utils.database import get_all_chats
-
-    chats = None
-    for attempt in range(1, 4):
-        try:
-            chats = await get_all_chats()
-            break
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "bot: could not load chats from DB to warm cache (attempt %d/3): %s",
-                attempt, exc,
-            )
-            if attempt < 3:
-                await asyncio.sleep(5 * attempt)
-
-    if chats is None:
-        LOGGER.warning("bot: giving up warming peer cache — DB unreachable.")
-        return
-
-    warmed = 0
-    for chat in chats:
-        try:
-            await bot.resolve_peer(chat["chat_id"])
-            warmed += 1
-        except Exception:  # noqa: BLE001 - bot may have left this chat
-            pass
-
-    LOGGER.info("bot: warmed peer cache for %d/%d known chats", warmed, len(chats))
-
-
 async def warm_recovery_peers(assistant):
     """Resolve peers ONLY for the chats we are about to rejoin on restart.
 
@@ -786,11 +748,6 @@ async def main():
             spawn(_recover_in_background())
         else:
             LOGGER.info("Playback recovery disabled by default; fresh /play owns playback.")
-
-    # The bot client needs its own warm-up (see warm_bot_peer_cache docstring) —
-    # run it in the background so a large Mongo chat list can never delay the
-    # first user command after deploy.
-    spawn(warm_bot_peer_cache(bot), name="bot-peer-warm")
 
     # ═══════════════════════════════════════════════════════════════════════
     # Everything below is secondary startup work.

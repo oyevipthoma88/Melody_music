@@ -45,15 +45,12 @@ async def search_cmd(client: Client, message: Message):
 @bot.on_callback_query(filters.regex(r"^play_search_(.+)$"))
 @error_handler
 async def play_search_cb(client: Client, cb):
-    from melody.core.ytdl import get_video_info, resolve_stream_urls
+    from melody.core.ytdl import get_video_info
     from melody.core.queue import set_last_user_track, Track
-    from melody.core.call import (
-        play_stream, ensure_assistant_peer, pre_join, reset_playback_speed,
-    )
+    from melody.core.call import play_stream
     from utils.formatters import format_duration
     from utils.database import add_history
     from utils.decorators import cb_playmode_gate
-    from utils.tasks import spawn
 
     chat = cb.message.chat
     user = cb.from_user
@@ -64,35 +61,9 @@ async def play_search_cb(client: Client, cb):
         return
 
     video_id = cb.data.split("play_search_")[1]
-    reset_playback_speed(chat.id)
     await cb.answer("🎵 Loading...")
 
-    # Search selections used to start direct resolution only after metadata
-    # finished, leaving the first playback path with a 4–8s cold resolve.
-    # Start both cheap preparations immediately; resolve_stream_urls has a
-    # single-flight cache, so play_stream reuses the result instead of doing a
-    # second network request.
-    import asyncio
-    warm_stream = asyncio.create_task(
-        resolve_stream_urls(video_id, want_video=False),
-        name=f"search-direct-warm-{video_id}",
-    )
-    spawn(ensure_assistant_peer(chat.id), name=f"search-peer-ready-{chat.id}")
-    spawn(pre_join(chat.id), name=f"search-prejoin-{chat.id}")
-
     info = await get_video_info(f"https://www.youtube.com/watch?v={video_id}")
-    # The warm resolver is strictly speculative. Never await it here: a
-    # blocked YouTube client must not hold the search-button playback path
-    # hostage. play_stream() has the authoritative direct/download race and
-    # will reuse the resolver result if it wins; consume the task outcome so a
-    # rejected speculative resolve cannot become an unhandled-task warning.
-    def _consume_warm_result(task):
-        try:
-            task.result()
-        except BaseException:
-            pass
-
-    warm_stream.add_done_callback(_consume_warm_result)
     if not info:
         await cb.answer("❌ Could not load song.", show_alert=True)
         return

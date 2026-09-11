@@ -1,5 +1,5 @@
 """
-💾 Personal saved playlists — parity with Yukki / AnonXMusic / VIPMusic.
+💾 Personal saved playlists — Melody personal playlist storage.
 
 Top music bots let every user keep a private playlist that survives restarts
 and can be queued in any group. Melody had only `/playlist <youtube url>`

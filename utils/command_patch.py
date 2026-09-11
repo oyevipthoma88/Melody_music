@@ -46,27 +46,23 @@ def _get_bot_username_lower() -> str:
     own `me.username` and cache it.
     """
     global _cached_username
-    config_u = ""
+    if _cached_username:
+        return _cached_username
     try:
         from melody.config import Config
-        config_u = (getattr(Config, "BOT_USERNAME", "") or "").lstrip("@").lower()
+        u = (getattr(Config, "BOT_USERNAME", "") or "").lstrip("@").lower()
     except Exception:
-        pass
-    # Never treat a cached username as immutable: Telegram permits username
-    # changes, and stale command-target filtering can make the bot appear dead.
-    # Compare against the already-loaded live `me` object without adding an RPC
-    # to the filter hot path.
-    live_u = ""
-    try:
-        from melody import bot as _bot
-        me = getattr(_bot, "me", None)
-        live_u = (getattr(me, "username", "") or "").lstrip("@").lower()
-    except Exception:
-        pass
-    u = live_u or config_u or _cached_username
-    if u != _cached_username:
+        u = ""
+    if not u:
+        try:
+            from melody import bot as _bot
+            me = getattr(_bot, "me", None)
+            u = (getattr(me, "username", "") or "").lstrip("@").lower()
+        except Exception:
+            u = ""
+    if u:
         _cached_username = u
-    return _cached_username
+    return u
 
 
 async def _trigger_enabled(chat_id: int) -> bool:

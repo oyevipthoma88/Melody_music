@@ -21,7 +21,6 @@ BUG FIX: ENTITY_BOUNDS_INVALID — switched all dynamic-text messages to HTML
    cycles random fire/celebration emojis while the join+search race runs.
 """
 import asyncio
-import os
 import time as _time
 import html
 from pyrogram import Client, filters, enums
@@ -42,7 +41,6 @@ from melody.core.call import (
     abort_prejoin_if_idle,
     ensure_assistant_peer,
     pre_join,
-    reset_playback_speed,
 )
 from melody.logging import log_activity
 from utils.database import add_history
@@ -52,48 +50,6 @@ from utils.thumbnails import make_thumbnail, fetch_dp, get_bot_dp, get_bot_ident
 from utils.animation import AnimatedStatus
 from utils.tasks import spawn
 
-
-def _is_stale_message_error(exc: BaseException) -> bool:
-    """Return True for Telegram errors caused by an already-gone message.
-
-    Status messages are intentionally ephemeral: users, auto-cleanup, another
-    handler, or a retry can delete them while a slow search/download is still
-    running. These errors must never turn a successful playback request into a
-    crash report.
-    """
-    name = type(exc).__name__
-    text = str(exc).upper()
-    return name in {"MessageIdInvalid", "MessageNotModified", "MessageToDeleteNotFound"} or any(
-        marker in text for marker in ("MESSAGE_ID_INVALID", "MESSAGE_NOT_MODIFIED", "MESSAGE_TO_DELETE_NOT_FOUND")
-    )
-
-
-async def _safe_processing_edit(processing, fallback_message, text, **kwargs):
-    """Edit the processing card, replying only when Telegram invalidated it."""
-    try:
-        return await processing.edit(text, **kwargs)
-    except Exception as exc:  # Telegram versions expose different exception classes
-        if not _is_stale_message_error(exc):
-            raise
-        if "MESSAGE_NOT_MODIFIED" in str(exc).upper() or type(exc).__name__ == "MessageNotModified":
-            return processing
-        try:
-            return await fallback_message.reply(text, **kwargs)
-        except Exception:
-            LOGGER.debug("processing status message disappeared in chat=%s", getattr(getattr(fallback_message, "chat", None), "id", "?"), exc_info=True)
-            return None
-
-
-async def _safe_processing_delete(processing):
-    """Best-effort cleanup that tolerates a status message deleted elsewhere."""
-    try:
-        return await processing.delete()
-    except Exception as exc:
-        if not _is_stale_message_error(exc):
-            raise
-        return None
-
-
 # Strong references to background download tasks so they aren't GC'd
 # before _stream_track picks them up via in-flight dedup in ytdl.py.
 _bg_downloads: set = set()
@@ -102,13 +58,12 @@ def get_play_buttons(
     chat_title: str,
     autoplay_on: bool = False,
     bot_username: "str | None" = None,
-    bot_name: str = "Melody",
-    chat_type: "enums.ChatType | None" = None,
+    bot_name: str = "Melody Music",
+    _chat_type: "enums.ChatType | None" = None,
     chat_id: int = 0,
     paused: bool = False,
 ) -> InlineKeyboardMarkup:
-    """Play-card keyboard — premium-emoji labels (aage + piche) and real
-    coloured buttons, built by `utils.inline` (AnonXMusic-style)."""
+    """Build Melody's premium play-card keyboard with safe button fallbacks."""
     from utils.inline import inline
 
     return inline.play_card(
@@ -126,13 +81,6 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
     """`stream_chat` overrides WHERE the audio is streamed (used by
     /channelplay: command typed in a group, music plays in the linked
     channel's voice chat). Replies always stay in `message.chat`."""
-    # Defensive mode guard: custom command patches or forwarded commands can
-    # lose the handler's boolean argument. Derive the mode from the actual
-    # command too, otherwise /vplay silently enters the audio-only path.
-    command_name = ""
-    if getattr(message, "command", None):
-        command_name = str(message.command[0]).lower().split("@", 1)[0]
-    video = bool(video or command_name in {"vplay", "cvplay", "vplayforce"})
     # Assistant session dead (e.g. 406 AUTH_KEY_DUPLICATED in the Heroku logs)?
     # Then no voice chat can ever be joined — say so clearly instead of letting
     # the request fail deep inside py-tgcalls after a long wait.
@@ -151,9 +99,6 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
     query = " ".join(message.command[1:]) if len(message.command) > 1 else None
     chat = stream_chat or message.chat
     user = message.from_user
-
-    # A fresh user request must never inherit a stale `/speed 2` state.
-    reset_playback_speed(chat.id)
 
     # 🏷 Tag-to-play: reply /play or /vplay to any audio/video/voice message
     # (or an audio/video document) to stream that exact file — no text query
@@ -180,7 +125,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
         return
 
     # 🔎 Inline play mode (/playmode inline) — instead of auto-playing the top
-    # hit, show the 5 best matches as tappable buttons (Yukki/AnonX parity).
+    # hit, show the five best matches as tappable buttons.
     # Only for a plain text query: links and tagged media are unambiguous, and
     # forcing a chooser on them would just add a pointless extra tap.
     if query and not tagged and not force and not query.lower().startswith(("http://", "https://")):
@@ -218,32 +163,18 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
             )
             return
 
-    # Known YouTube links/IDs are unambiguous. Start their direct stream
-    # resolver before metadata enrichment; resolve_stream_urls() has its own
-    # single-flight lock/cache, so _warm_sources/_build_direct_stream reuse it.
+    # A manual request owns the single safe yt-dlp slot. Stop only lower
+    # priority background work; never start a second direct resolver for the
+    # same track. `_stream_track()` is the single owner of direct resolution
+    # and its bounded fallback race.
+    direct_id = None
     if query and not tagged:
         from melody.core.ytdl import extract_video_id, is_valid_video_id
         direct_id = extract_video_id(query) or (
             query.strip() if is_valid_video_id(query.strip()) else None
         )
-        if direct_id:
-            async def _warm_direct_source():
-                try:
-                    from melody.core.ytdl import resolve_stream_urls
-                    await resolve_stream_urls(direct_id, want_video=video)
-                except Exception as exc:
-                    LOGGER.debug("early direct warm failed for %s: %s", direct_id, exc)
-
-            spawn(_warm_direct_source(), name=f"direct-warm-{direct_id}")
-
-        # A manual request owns the single safe yt-dlp slot. Stop only lower
-        # priority background work; never cancel a same-video shared download
-        # that this request can safely deduplicate onto.
         from melody.core.ytdl import cancel_lower_priority_downloads
-        cancel_lower_priority_downloads(
-            max_priority=0,
-            exclude_video_id=direct_id,
-        )
+        cancel_lower_priority_downloads(max_priority=0, exclude_video_id=direct_id)
 
     if not (query and not tagged):
         from melody.core.ytdl import cancel_lower_priority_downloads
@@ -259,17 +190,6 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
     # "gaana 15 sec baad bajta hai" delay actually comes from (search vs.
     # extraction vs. VC join vs. PyTgCalls handoff). One compact log line.
     _t0 = _time.monotonic()
-    try:
-        # Cold YouTube CDN routes can legitimately need more than 10s across
-        # metadata resolution and ffprobe startup. Keep one bounded deadline
-        # shared with call._stream_track so the caller cannot cancel a healthy
-        # playback handoff prematurely.
-        _startup_budget = min(
-            30.0, max(8.0, float(os.getenv("PLAY_STARTUP_DEADLINE", "20")))
-        )
-    except (TypeError, ValueError):
-        _startup_budget = 20.0
-    _startup_deadline = _t0 + _startup_budget
 
     def _lap() -> float:
         return round(_time.monotonic() - _t0, 2)
@@ -315,9 +235,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
         # Telegram UI round-trips are non-audio work and can add seconds on a
         # busy group. Keep the task running, but let search/stream/VC progress
         # as soon as metadata is available.
-        info = await asyncio.wait_for(
-            info_task, timeout=max(0.05, _startup_deadline - _time.monotonic())
-        )
+        info = await info_task
         _t_info = _lap()
 
         if not info:
@@ -326,7 +244,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
             await abort_prejoin_if_idle(chat.id)
             await anim.stop()
             if tagged:
-                await _safe_processing_edit(processing, message,
+                await processing.edit(
                     quote_html("❌ Ye tagged file play nahi ho payi 🌸"),
                     parse_mode=enums.ParseMode.HTML,
                 )
@@ -363,14 +281,14 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
                     for i, r in enumerate(suggestions[:5], 1)
                     if r.get("id")
                 ]
-                await _safe_processing_edit(processing, message,
+                await processing.edit(
                     quote_html(text),
                     parse_mode=enums.ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup(buttons),
                 )
                 return
 
-            await _safe_processing_edit(processing, message,
+            await processing.edit(
                 quote_html(
                     "❌ <b>Kuch bhi match nahi hua</b> 🌸\n"
                     "Naam thoda alag likh ke ya artist ka naam jod ke try karo."
@@ -402,6 +320,8 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
             cached_file_path,
             download_audio,
             is_tg_media_id,
+            on_cloud_host,
+            resolve_stream_urls,
             should_try_direct_stream,
         )
 
@@ -435,18 +355,34 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
                     ),
                     return_exceptions=True,
                 )
-            # Do not resolve the current track here. _stream_track() starts
-            # the authoritative direct resolver a few lines later; warming it
-            # here created a duplicate same-key resolve which serialized behind
-            # the resolver lock and made the real playback task wait 8-10s
-            # (especially after a large /vplay had occupied the dyno). The
-            # interactive owner also starts the download fallback when needed,
-            # so this warm task must stay idle for direct playback.
-            return []
+            try:
+                await resolve_stream_urls(video_id, want_video=want_video)
+                return []
+            except Exception as exc:
+                LOGGER.info(
+                    "warm resolve failed for %s (%s) — playback will own fallback download",
+                    video_id, exc,
+                )
+                # On Heroku, _stream_track() already starts the interactive
+                # fallback immediately. Starting a second warm download here
+                # races direct resolution, inflates RSS, and can trigger R14;
+                # leave ownership with the bounded playback path.
+                if on_cloud_host():
+                    return []
+                return await asyncio.gather(
+                    download_audio(
+                        video_id, audio_only=not want_video, priority=0, owner=chat.id,
+                    ),
+                    return_exceptions=True,
+                )
 
-        warm_task = asyncio.create_task(_warm_sources(info["id"], video))
-        _bg_downloads.add(warm_task)
-        warm_task.add_done_callback(_bg_downloads.discard)
+        # SPEED FIX: warm ONLY the cheap metadata resolve, in the background,
+        # the instant the video id is known. resolve_stream_urls() dedupes on a
+        # per-video lock and caches its result, so this does not duplicate the
+        # work call.py does — it simply moves it earlier, overlapping it with
+        # the VC join and the "processing" message instead of paying for it
+        # after the user is already waiting.
+        spawn(_warm_sources(info["id"], video), name=f"warm-src-{info['id']}")
 
         track = Track(
             video_id=info["id"],
@@ -473,12 +409,10 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
         if force:
             playing_now = await force_play_stream(
                 chat.id, track, video=video, prejoin=False,
-                deadline=_startup_deadline,
             )
         else:
             playing_now = await play_stream(
                 chat.id, track, video=video, prejoin=False,
-                deadline=_startup_deadline,
             )
         _total_elapsed = _lap()
         _stream_elapsed = max(0.0, _total_elapsed - _t_join) if playing_now else 0.0
@@ -489,7 +423,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
             processing = await processing_task
             anim = await anim_task
             await anim.stop()
-            await _safe_processing_edit(processing, message,
+            await processing.edit(
                 quote_html(
                     "❌ <b>Gana play nahi ho paya.</b>\n"
                     "YouTube stream unavailable ho sakti hai ya VC handoff complete nahi hua.\n"
@@ -519,17 +453,10 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
 
         activity_label = "Force Played" if force else ("Now Playing" if playing_now else "Queued")
         spawn(log_activity(
-            f"#play #{'vplay' if video else 'play'}\n"
             f"🎵 <b>{activity_label}</b>\n"
             f"• Song: <code>{html.escape(info['title'][:60])}</code>\n"
-            f"• Uploader: <code>{html.escape(str(info.get('uploader') or 'Unknown'))}</code>\n"
-            f"• Video ID: <code>{html.escape(str(info.get('id') or '—'))}</code>\n"
-            f"• Requested by: {html.escape(requester_name or 'Unknown')} "
-            f"(<code>{requester_id}</code>)\n"
-            f"• Group: <b>{html.escape(chat.title or 'Private')}</b> (<code>{chat.id}</code>)\n"
-            f"• Mode: <code>{'VIDEO' if video else 'AUDIO'}</code> · Result: <b>{_outcome.upper()}</b>\n"
-            f"• Timing: search=<code>{_t_info:.2f}s</code> join=<code>{_t_join - _t_info:.2f}s</code> "
-            f"stream=<code>{_stream_elapsed:.2f}s</code> total=<code>{_total_elapsed:.2f}s</code>"
+            f"• Requested by: {html.escape(requester_name or 'Unknown')} (<code>{requester_id}</code>)\n"
+            f"• Chat: {html.escape(chat.title or 'Private')} (<code>{chat.id}</code>)"
         ))
 
         status_label = "Force Played" if force else ("Now Playing" if playing_now else "Added to Queue")
@@ -576,7 +503,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
                 parse_mode=enums.ParseMode.HTML,
                 reply_markup=play_buttons,
             )
-            await _safe_processing_delete(processing)
+            await processing.delete()
         except Exception as thumb_exc:
             from melody.logging import send_error_log
             # CHAT_SEND_PHOTOS_FORBIDDEN is an expected group-permission
@@ -605,7 +532,7 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
             # failed before delete), so edit it. But if it was already deleted
             # (partial success path), fall back to a new reply.
             try:
-                await _safe_processing_edit(processing, message,
+                await processing.edit(
                     quote_html(
                         f"🎵 <b>{html.escape(status)}</b>\n\n"
                         f"<code>{safe_title}</code>\n"
