@@ -49,7 +49,7 @@ _RESOLVE_TIMEOUT = min(_RESOLVE_TIMEOUT, _DIRECT_RESOLVE_MAX)
 # How long InnerTube gets the CPU/network to itself before the heavy yt-dlp
 # fallback is started as well (see resolve_stream_urls).
 try:
-    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "1.20"))
+    _INNERTUBE_HEADSTART = float(os.getenv("INNERTUBE_HEADSTART", "0.70"))
 except Exception:  # noqa: BLE001
     _INNERTUBE_HEADSTART = 0.60
 
@@ -58,7 +58,7 @@ except Exception:  # noqa: BLE001
 # the cookie-authenticated yt-dlp path even gets a chance. Mute the host-level
 # InnerTube stream probe after consecutive failures and periodically re-test.
 try:
-    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "3")))
+    _IT_MUTE_AFTER = max(1, int(os.getenv("INNERTUBE_MUTE_AFTER", "2")))
 except Exception:  # noqa: BLE001
     _IT_MUTE_AFTER = 1
 try:
@@ -242,6 +242,67 @@ def _locked_ytdl(opts: dict):
     # Keep yt-dlp's own console-title/cookie/request-director cleanup intact.
     with ydl as active:
         yield active
+
+
+# ── Warm, reusable YoutubeDL for metadata/URL resolves ──────────────────────
+# SPEED FIX (Sep 10 log: stream=3.2-3.6s on every cold /play): a brand-new
+# YoutubeDL was constructed for each resolve, so its in-process caches (solved
+# nsig/player functions, extractor state, the pooled TLS/HTTP connections of
+# the request director) were thrown away every time and each song paid the
+# handshake + player-solve cost again. One warm instance per option shape is
+# reused instead; a fresh throwaway is only built when the warm one is busy
+# with another track, and the instance is retired periodically so it can never
+# accumulate state or stale cookies.
+_WARM_YDL: dict = {}
+_WARM_YDL_LOCK = threading.Lock()
+try:
+    _WARM_YDL_TTL = max(60.0, float(os.getenv("YTDLP_WARM_TTL", "900")))
+except Exception:  # noqa: BLE001
+    _WARM_YDL_TTL = 900.0
+
+
+def _warm_extract(opts: dict, target: str, cache_key: str = "resolve"):
+    """extract_info(download=False) on a warm YoutubeDL when one is free."""
+    now = _time_mod.monotonic()
+    entry = None
+    with _WARM_YDL_LOCK:
+        cached = _WARM_YDL.get(cache_key)
+        if cached and cached["born"] + _WARM_YDL_TTL > now:
+            entry = cached
+        else:
+            if cached:
+                _WARM_YDL.pop(cache_key, None)
+                try:
+                    cached["ydl"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                with _YTDLP_INIT_LOCK:
+                    entry = {
+                        "ydl": YoutubeDL(opts),
+                        "lock": threading.Lock(),
+                        "born": now,
+                    }
+                _WARM_YDL[cache_key] = entry
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("warm YoutubeDL unavailable: %s", exc)
+                entry = None
+
+    if entry is not None and entry["lock"].acquire(blocking=False):
+        try:
+            return entry["ydl"].extract_info(target, download=False)
+        except Exception:
+            # A poisoned warm instance must not break later tracks.
+            with _WARM_YDL_LOCK:
+                if _WARM_YDL.get(cache_key) is entry:
+                    _WARM_YDL.pop(cache_key, None)
+            raise
+        finally:
+            entry["lock"].release()
+
+    # Warm instance busy with another song — do not queue behind it.
+    with _locked_ytdl(opts) as ydl:
+        return ydl.extract_info(target, download=False)
 
 
 # ── In-memory metadata cache (avoids re-querying YouTube for recently
@@ -1269,9 +1330,15 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # the direct resolve cost 4.2-5.7s). Once this host is known to be
         # blocked for mobile clients, ask ONLY the cookie-authenticated
         # web/TV clients that actually answer here.
+        # SPEED FIX (Sep 10 17:57 log: EVERY mobile InnerTube probe answered
+        # "Sign in to confirm you're not a bot", yet yt-dlp still asked
+        # android_vr / default / ios on every resolve -> three dead player
+        # round-trips ahead of the one client that actually answers on this
+        # host, which is why stream= stayed at 3.2-3.6s). With cookies
+        # present, ask only the two cookie/PO-token clients that work here.
         "player_client": (
-            ["web_safari", "default", "tv_simply"]
-            if (has_cookies and _innertube_stream_muted())
+            ["web_safari", "tv_simply"]
+            if has_cookies
             else ["web_safari", "android_vr", "default", "ios"]
         ),
         "formats": ["missing_pot"],
@@ -1326,6 +1393,11 @@ def _ydl_opts(audio_only: bool = True) -> dict:
 
     opts: dict = {
         "quiet": True,
+        # SPEED FIX: pin yt-dlp's cache to a stable writable dir so the solved
+        # player JS / nsig functions and the downloaded EJS component are
+        # reused across resolves and dyno restarts instead of being fetched
+        # and re-solved on the critical path of every cold /play.
+        "cachedir": os.getenv("YTDLP_CACHE_DIR", "/tmp/yt-dlp-cache"),
         # LOG FIX: yt-dlp still emits the "\r ... (frag 21/37)" progress
         # bar even with quiet=True (progress goes to stderr independently).
         # On Heroku every carriage-return chunk became its own log line.
@@ -5431,8 +5503,9 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
     # The format selector only matters for a download; picking the streamable
     # pair by hand needs the FULL format list, so drop the selector here.
     opts.pop("format", None)
-    with _locked_ytdl(opts) as ydl:
-        info = ydl.extract_info(target, download=False)
+    info = _warm_extract(
+        opts, target, cache_key=f"resolve:{'v' if want_video else 'a'}"
+    )
     if info and info.get("entries"):
         info = info["entries"][0]
     info = info or {}
