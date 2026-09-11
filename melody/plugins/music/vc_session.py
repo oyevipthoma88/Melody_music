@@ -1,5 +1,5 @@
 """
-🛰 VC session commands — Melody voice-chat session controls.
+🛰 VC session commands — parity with Yukki / AnonXMusic / VIPMusic.
 
 Missing before this module:
 

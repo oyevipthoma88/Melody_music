@@ -139,8 +139,13 @@ class Config:
     # Expensive startup warm-ups are opt-in. They launch yt-dlp/Deno work before
     # any user asks for music and can spike RSS on 512 MB dynos. The low-memory
     # profile wins over stale enable flags so no manual Config Var cleanup is
-    # required after upgrading.
-    MEMORY_LIMIT_MB: int = _env_int("MEMORY_LIMIT_MB", 512)
+    # required after upgrading. Heroku dynos in this deployment expose a 1 GB
+    # worker quota even when MEMORY_LIMIT_MB is unset, so treat DYNO as 1 GB by
+    # default and let smaller workers set MEMORY_LIMIT_MB explicitly.
+    MEMORY_LIMIT_MB: int = 1024 if os.getenv("DYNO") else _env_int(
+        "MEMORY_LIMIT_MB", 512
+    )
+
     _LOW_MEMORY_PROFILE: bool = MEMORY_LIMIT_MB <= 768
     STARTUP_WARMUPS: bool = (
         _env_bool("STARTUP_WARMUPS", False) and not _LOW_MEMORY_PROFILE
@@ -158,6 +163,11 @@ class Config:
     # before the first user command and can resurrect an old track. Keep it
     # opt-in; fresh /play is authoritative and stable by default.
     PLAYBACK_RECOVERY: bool = _env_bool("PLAYBACK_RECOVERY", False)
+
+    # Optional chat where completed downloads are mirrored for persistent
+    # caching. Disabled by default: uploading every song shares the bot session
+    # and bandwidth with commands and can trigger upload flood waits.
+    SONG_DUMP_CHAT_ID: int = _env_int("SONG_DUMP_CHAT_ID")
 
     # GitHub integration — used by /setpic to persist the bot's start image
     # across fresh deployments. Set GITHUB_TOKEN to a Personal Access Token

@@ -53,7 +53,7 @@ async def remove_cmd(client: Client, message: Message):
         await send_quote(message, "❌ <b>Invalid position.</b>", client=client)
 
 
-# Queue-position support: a one-line summary of the
+# PARITY (/queuepos in Yukki, AnonXMusic, VIPMusic): a one-line summary of the
 # queue — what is playing, how many tracks are pending and how long that is.
 @bot.on_message(filters.command(["queuepos", "qpos"]) & filters.group)
 @error_handler

@@ -87,8 +87,8 @@ def create_clients() -> tuple:
         # Keep the bot responsive without creating a large handler pool on a
         # 512 MB dyno. Slow handlers are already isolated by command locks and
         # background tasks; excess workers only increase RSS under bursts.
-        workers=_worker_count("BOT_WORKERS", 8, 16),
-        max_concurrent_transmissions=_worker_count("BOT_TRANSMISSIONS", 2, 4),
+        workers=_worker_count("BOT_WORKERS", 4, 8),
+        max_concurrent_transmissions=_worker_count("BOT_TRANSMISSIONS", 1, 2),
     )
     assistant = Client(
         "MelodyAssistant",
@@ -96,8 +96,8 @@ def create_clients() -> tuple:
         api_hash=Config.API_HASH,
         session_string=Config.STRING_SESSION,
         sleep_threshold=15,
-        workers=_worker_count("ASSISTANT_WORKERS", 4, 8),
-        max_concurrent_transmissions=_worker_count("ASSISTANT_TRANSMISSIONS", 2, 4),
+        workers=_worker_count("ASSISTANT_WORKERS", 2, 4),
+        max_concurrent_transmissions=_worker_count("ASSISTANT_TRANSMISSIONS", 1, 2),
         parse_mode=enums.ParseMode.HTML,
     )
 

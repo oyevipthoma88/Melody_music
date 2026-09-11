@@ -1,7 +1,7 @@
 """
 🎛 /playmode — who can play, and how results are picked.
 
-Melody playback mode support:
+MISSING-FEATURE PARITY: every top music bot (Yukki, AnonXMusic, VIPMusic,
 TgMusicBot) ships /playmode. Melody hard-coded BOTH halves of it:
 
   • access — /play was permanently admin/auth-only, so in a normal group no

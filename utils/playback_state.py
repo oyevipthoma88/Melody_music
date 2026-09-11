@@ -125,72 +125,13 @@ async def mark_inactive(chat_id: int, *, clear: bool = False) -> None:
         raise
 
 
-async def _deduplicate_chat_snapshots() -> int:
-    """Keep one snapshot per chat before building the unique index.
-
-    Older deployments wrote snapshots without a unique index, so a restart can
-    encounter MongoDB E11000 while trying to create ``chat_id_1``. Preserve
-    the newest active snapshot (or newest updated snapshot) and remove only
-    the redundant documents; playback itself does not depend on this metadata.
-    """
-    cursor = state_col.find(
-        {},
-        {"_id": 1, "chat_id": 1, "active": 1, "position_updated_at": 1},
-    ).sort([
-        ("chat_id", 1),
-        ("active", -1),
-        ("position_updated_at", -1),
-        ("_id", -1),
-    ])
-    rows = await cursor.to_list(None)
-    duplicate_ids = []
-    seen = set()
-    for row in rows:
-        chat_id = row.get("chat_id")
-        if chat_id in seen:
-            duplicate_ids.append(row["_id"])
-        else:
-            seen.add(chat_id)
-    if duplicate_ids:
-        await state_col.delete_many({"_id": {"$in": duplicate_ids}})
-        LOGGER.warning(
-            "Removed %d duplicate playback snapshot(s) before unique index creation",
-            len(duplicate_ids),
-        )
-    return len(duplicate_ids)
-
-
 async def ensure_indexes() -> None:
     if _WRITES_DISABLED:
         return
     try:
         await state_col.create_index("chat_id", unique=True)
-        return
     except Exception as exc:
         if _is_storage_quota_error(exc):
             _disable_writes(exc)
             return
-        # A pre-existing non-unique index can contain duplicate chat IDs. Clean
-        # that legacy data once, then rebuild the index instead of logging a
-        # startup warning on every dyno restart.
-        text = str(exc).lower()
-        is_duplicate_index_error = (
-            "duplicate key" in text
-            or "e11000" in text
-            or getattr(exc, "code", None) == 11000
-        )
-        if not is_duplicate_index_error:
-            raise
-        await _deduplicate_chat_snapshots()
-        try:
-            await state_col.drop_index("chat_id_1")
-        except Exception as drop_exc:
-            if "index not found" not in str(drop_exc).lower():
-                LOGGER.debug("Could not drop legacy playback index: %s", drop_exc)
-        try:
-            await state_col.create_index("chat_id", unique=True)
-        except Exception as retry_exc:
-            if _is_storage_quota_error(retry_exc):
-                _disable_writes(retry_exc)
-                return
-            raise
+        raise

@@ -1,10 +1,11 @@
 """
 📡 /live · /stream · /m3u8 · /radio · /replay
 
-Direct-stream support:
-Melody accepts raw HLS/m3u8, internet-radio ICY and direct media URLs in
-addition to searchable sources. The `/replay` command restarts the current
-track from 00:00 when the source supports seeking.
+MISSING-FEATURE PARITY (Yukki / AnonXMusic / VIPMusic / TgMusicBot):
+Melody could only play things it could *resolve on YouTube*. Every top music
+bot also plays a raw stream endpoint — an HLS/m3u8 link, an internet-radio
+ICY stream, or any direct media URL — and every one of them has /replay to
+restart the current track from 00:00.
 
 Implementation note: the raw URL is stored as the Track's `video_id`. That is
 deliberate — `resolve_stream_urls()` already accepts any http(s) source, and
@@ -166,7 +167,7 @@ async def radio_cmd(client: Client, message: Message):
 @error_handler
 @admin_or_auth
 async def replay_cmd(client: Client, message: Message):
-    """Restart the current track from the beginning."""
+    """Restart the current track from the beginning (Yukki/AnonX parity)."""
     track = get_current(message.chat.id)
     if not track:
         await message.reply(

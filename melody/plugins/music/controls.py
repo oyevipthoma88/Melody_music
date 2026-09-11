@@ -5,8 +5,6 @@ BUG FIX: @error_handler moved OUTSIDE @admin_or_auth
 import html
 import asyncio
 
-# Keep Genius/ONNX work off asyncio's tiny default executor (see pools.py).
-from melody.core.pools import IO_POOL
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery
 from melody import bot
@@ -15,7 +13,7 @@ from melody.core.call import (
 )
 from melody.core.queue import (
     format_queue, get_current, is_autoplay_on, set_autoplay,
-    add_to_queue, set_predownloaded, autoplay_generation,
+    add_to_queue, set_predownloaded,
 )
 from melody.core.autoplay import prefetch_next
 from melody.logging import LOGGER, log_activity
@@ -133,7 +131,7 @@ async def skip_cmd(client: Client, message: Message):
         return
 
     # MISSING-FEATURE PARITY: `/skip <n>` jumps straight to queue position n
-    # Everything before position n
+    # (Yukki/AnonXMusic/VIPMusic all support it). Everything before position n
     # is dropped, then the normal skip advances into it.
     if len(message.command) > 1:
         from melody.core.queue import remove_from_queue
@@ -281,10 +279,9 @@ async def autoplay_toggle_callback(client: Client, cb: CallbackQuery):
     await cb.answer(f"🤖 AutoPlay {'ON 🟢' if new_state else 'OFF 🔴'}")
 
     if new_state and get_current(chat_id):
-        generation = autoplay_generation(chat_id)
         async def _queue_next_autoplay_track():
             track = await prefetch_next(chat_id)
-            if track and generation == autoplay_generation(chat_id) and await is_autoplay_on(chat_id):
+            if track:
                 add_to_queue(chat_id, track)
                 set_predownloaded(chat_id, None)
         spawn(_queue_next_autoplay_track())
@@ -314,41 +311,8 @@ async def noop_callback(client: Client, cb: CallbackQuery):
     await cb.answer()
 
 
-@bot.on_callback_query(filters.regex("^lyrics$"))
-@error_handler
-async def lyrics_callback(client: Client, cb: CallbackQuery):
-    await cb.answer("🎵 Fetching lyrics...")
-    track = get_current(cb.message.chat.id)
-    if not track:
-        await send_quote(cb.message, "❌ Nothing is playing right now.", client=client)
-        return
 
-    try:
-        import lyricsgenius
-        from melody.config import Config
-        if not Config.GENIUS_API_TOKEN:
-            await send_quote(cb.message, "⚠️ Genius API token not configured.", client=client)
-            return
-
-        genius = lyricsgenius.Genius(Config.GENIUS_API_TOKEN, verbose=False, remove_section_headers=True)
-        import asyncio as _asyncio
-        loop = _asyncio.get_running_loop()
-        song = await loop.run_in_executor(IO_POOL, lambda: genius.search_song(track.title, track.uploader))
-        if song and song.lyrics:
-            safe_title = html.escape(track.title)
-            lyrics_text = html.escape(song.lyrics[:3500])
-            await send_quote(
-                cb.message,
-                f"🎵 <b>{safe_title}</b>\n\n<blockquote expandable>{lyrics_text}</blockquote>",
-                client=client,
-            )
-        else:
-            await send_quote(cb.message, "❌ Lyrics not found.", client=client)
-    except Exception:
-        await send_quote(cb.message, "❌ Could not fetch lyrics.", client=client)
-
-
-# ─── Unified `controls <action> <chat_id>` router ────────────
+# ─── AnonXMusic-style unified `controls <action> <chat_id>` router ────────────
 #
 # The new premium/coloured play card (utils/inline.py) sends one callback
 # scheme for every transport button, carrying the target chat id so the card

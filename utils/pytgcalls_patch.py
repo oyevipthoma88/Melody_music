@@ -39,11 +39,9 @@ WHAT THIS PATCH DOES
 Call `apply_pytgcalls_probe_patch()` once at import time of call.py.
 """
 from __future__ import annotations
-
 import logging
 import os
 import time
-
 from melody.logging import redact_sensitive_text
 
 log = logging.getLogger(__name__)
@@ -179,19 +177,14 @@ def _is_local_file(path) -> bool:
 
 
 def _is_local_proxy_url(path) -> bool:
-    """True for Melody-owned loopback Telegram range-proxy URLs.
-
-    These URLs are intentionally bound to localhost and are not public CDN
-    sources. Treating them as remote makes the ffprobe wrapper raise
-    ``StreamProbeUnavailable`` even though the aiohttp proxy is healthy.
-    """
-    if not isinstance(path, str):
-        return False
-    value = path.lower()
-    return value.startswith(("http://127.0.0.1:", "http://localhost:")) and "/tg/" in value
+    """Return True for the in-process Telegram range proxy URL."""
+    return isinstance(path, str) and path.lower().startswith(
+        ("http://127.0.0.1:", "http://localhost:")
+    )
 
 
 def _is_local_source(path) -> bool:
+    """Treat local files and our localhost media proxy as local sources."""
     return _is_local_file(path) or _is_local_proxy_url(path)
 
 
@@ -309,9 +302,8 @@ try:
     _REMOTE_CHECK_TIMEOUT = max(0.25, float(os.getenv("REMOTE_CHECK_TIMEOUT", "2.5")))
 except (TypeError, ValueError):
     _REMOTE_CHECK_TIMEOUT = 2.5
-# SPEED FIX: on Heroku/Railway/Render/Fly a slow CDN preflight must not eat the
-# playback budget — the parallel download is already racing. Local/self-hosted
-# deployments keep the operator value.
+# On Heroku/Railway/Render/Fly, a slow probe must not consume the 5-second
+# playback budget. Keep the operator setting for local/non-cloud deployments.
 _IS_CLOUD = bool(
     os.getenv("DYNO")
     or os.getenv("RAILWAY_ENVIRONMENT")
@@ -326,17 +318,24 @@ _REMOTE_CHECK_BUDGET = min(
     _REMOTE_CHECK_TIMEOUT,
     _cloud_budget if _IS_CLOUD else _REMOTE_CHECK_TIMEOUT,
 )
+_remote_probe_disabled = False
 try:
-    _REMOTE_CHECK_CACHE_TTL = max(0.5, float(os.getenv("REMOTE_CHECK_CACHE_TTL", "10")))
+    _REMOTE_CHECK_CACHE_TTL = max(
+        0.5, float(os.getenv("REMOTE_CHECK_CACHE_TTL", "10"))
+    )
 except (TypeError, ValueError):
     _REMOTE_CHECK_CACHE_TTL = 10.0
 _remote_reach_cache: dict[str, float] = {}
 _REMOTE_REACH_CACHE_MAX = 256
-_remote_probe_disabled = False
 
 
 def _http_reachable_sync(url: str, timeout: float, headers: dict | None = None) -> bool:
-    """True when the CDN answers a 1-byte ranged GET with a success status.
+    """True when the CDN returns actual bytes from a ranged media GET.
+
+    Checking only the HTTP status accepted URLs whose headers arrived but whose
+    media body then stalled; PyTgCalls timed out later and wasted the whole
+    direct-play window. Reading a tiny payload here makes the probe validate
+    the same data path that FFmpeg will consume.
 
     ROOT CAUSE of the "10 second silence before the song starts":
     py-tgcalls pre-probes every source with `ffprobe`. On this host ffprobe
@@ -393,11 +392,18 @@ def _http_reachable_sync(url: str, timeout: float, headers: dict | None = None) 
         # while trying the inferred client UA variants above as fallbacks.
         if supplied.get("Referer"):
             request_headers["Referer"] = supplied["Referer"]
+        for header_name in ("Origin", "Cookie"):
+            if supplied.get(header_name):
+                request_headers[header_name] = supplied[header_name]
         # urllib is frequently rejected by YouTube’s CDN even when the same
         # URL works with the Chrome TLS fingerprint used by yt-dlp. Prefer the
         # installed curl_cffi transport first; retain urllib as a dependency-free
         # fallback for non-YouTube hosts and minimal installations.
         if curl_requests is not None:
+            # curl_cffi matches the TLS fingerprint used by the resolver and
+            # is the only transport worth waiting for on YouTube CDN URLs.
+            # Do not immediately repeat the same probe through urllib: that
+            # doubled the worst-case gate before ffmpeg could start.
             try:
                 resp = curl_requests.get(
                     url,
@@ -408,9 +414,6 @@ def _http_reachable_sync(url: str, timeout: float, headers: dict | None = None) 
                 )
                 try:
                     if 200 <= int(resp.status_code) < 400:
-                        # A status-only check accepted URLs whose headers
-                        # arrived but whose media body then stalled; ffmpeg
-                        # timed out later and the whole window was wasted.
                         first_bytes = next(resp.iter_content(chunk_size=2), b"")
                         return bool(first_bytes)
                 finally:
@@ -433,7 +436,8 @@ async def _remote_reachable(url: str, headers: dict | None = None) -> bool:
     if not isinstance(url, str) or not url.lower().startswith(("http://", "https://")):
         return False
     now = time.monotonic()
-    if _remote_reach_cache.get(url, 0.0) > now:
+    cached_until = _remote_reach_cache.get(url, 0.0)
+    if cached_until > now:
         return True
     loop = asyncio.get_running_loop()
     try:
@@ -447,8 +451,8 @@ async def _remote_reachable(url: str, headers: dict | None = None) -> bool:
         if reachable:
             _remote_reach_cache[url] = time.monotonic() + _REMOTE_CHECK_CACHE_TTL
             if len(_remote_reach_cache) > _REMOTE_REACH_CACHE_MAX:
-                ordered = sorted(_remote_reach_cache, key=_remote_reach_cache.get)
-                for old_url in ordered[: len(_remote_reach_cache) - _REMOTE_REACH_CACHE_MAX]:
+                cutoff = sorted(_remote_reach_cache, key=_remote_reach_cache.get)
+                for old_url in cutoff[: len(_remote_reach_cache) - _REMOTE_REACH_CACHE_MAX]:
                     _remote_reach_cache.pop(old_url, None)
         return bool(reachable)
     except Exception:
@@ -482,28 +486,24 @@ def apply_pytgcalls_probe_patch() -> None:
             stream_headers = args[1]
         elif isinstance(kwargs.get("headers"), dict):
             stream_headers = kwargs["headers"]
-        # Melody's Telegram range proxy is already an HTTP byte-range source
-        # backed by the media object. Running ffprobe before Py-TgCalls opens
-        # it causes an avoidable full probe/tail-range timeout on multi-GB MKV
-        # files; Py-TgCalls/ffmpeg can consume the same source directly.
-        if _is_local_proxy_url(path):
-            log.debug("local Telegram proxy — skipping pre-probe for %s", _short_source(path))
-            return None
         # PERMANENT FIX: no ffprobe binary on this host => nothing to probe
         # with. Skip the pre-check instead of killing every single /play.
         if not _ffprobe_available():
             return None
-        # SPEED FIX: an early-handoff source is a *growing* file. ffprobe waits
-        # for EOF/an index on it and blocks the first audio frame for seconds
-        # (and can raise TimeoutError). WebM/Opus prefixes are self-describing,
-        # so hand the file straight to ffmpeg.
-        _path_text = str(path)
-        if (
-            _path_text.endswith((".part", ".ytdl", ".temp", ".tmp"))
-            or ".part-" in _path_text
-            or ".ytdl" in _path_text
-        ):
-            log.info("⚡ early-handoff partial file — skipping ffprobe pre-check.")
+        # SPEED JUGAAD: Skip ffprobe for growing .part files to prevent infinite hang
+        if str(path).endswith(".part") or ".part-" in str(path) or ".ytdl" in str(path):
+            log.info("⚡ Early-handoff partial file — skipping ffprobe.")
+            return None
+        # SPEED JUGAAD: Skip ffprobe for growing .part files to prevent infinite hang
+        if str(path).endswith(".part") or ".part-" in str(path) or ".ytdl" in str(path):
+            log.info("⚡ Early-handoff partial file — skipping ffprobe.")
+            return None
+        # The Telegram range proxy is an in-process source controlled by this
+        # worker. ffprobe cannot reliably inspect a live MKV/MP4 range stream
+        # before FFmpeg opens it, so probing only adds a 4-second timeout and
+        # does not improve safety. Let PyTgCalls consume the proxy directly.
+        if _is_local_proxy_url(path):
+            log.info("⚡ Telegram media proxy detected — skipping ffprobe pre-check, playing directly.")
             return None
         # LOG FIX: retrying a probe that already failed on a LOCAL file just
         # burns another ffprobe timeout (the log shows every local track probed
@@ -515,7 +515,7 @@ def apply_pytgcalls_probe_patch() -> None:
             # fallback); only a genuinely dead URL falls through to ffprobe
             # and the download path below.
             if ".m3u8" in str(path).lower():
-                log.info("⚡ HLS source — skipping remote preflight, playing directly.")
+                log.info("⚡ HLS source detected — skipping remote preflight.")
                 return None
             if await _remote_reachable(path, stream_headers):
                 log.info(
@@ -523,10 +523,17 @@ def apply_pytgcalls_probe_patch() -> None:
                     "playing directly."
                 )
                 return None
-            # Expected, recoverable fallback (the download path handles it),
-            # so this must not look like an error in the logs.
+            # The ranged GET is the authoritative, bounded remote preflight.
+            # Do not fall through to py-tgcalls' ffprobe here: on a blocked or
+            # throttled googlevideo URL ffprobe can spend 4s twice and then
+            # raise JSONDecodeError/ProcessLookupError. The local download is
+            # already racing in _stream_track(), so fail immediately and let
+            # that healthy fallback win instead of adding 8-15s of silence.
             log.debug(
-                "remote source did not answer a ranged GET — verifying with ffprobe."
+                "remote source failed ranged preflight — using download fallback."
+            )
+            raise StreamProbeUnavailable(
+                "remote source failed bounded ranged preflight"
             )
         attempts = (1,) if local else (1, 2)
         for attempt in attempts:
@@ -582,10 +589,13 @@ def apply_pytgcalls_probe_patch() -> None:
         if local:
             # The file may simply be too fresh (early hand-off while yt-dlp is
             # still writing). Wait for it to grow and probe one last time.
-            if _is_local_file(path) and not _is_local_playable(path) and await _wait_for_growth(path):
+            if not _is_local_playable(path) and await _wait_for_growth(path):
                 try:
-                    return await original(
-                        ffmpeg_parameters, path, stream_parameters, *args, **kwargs
+                    return await _asyncio.wait_for(
+                        original(
+                            ffmpeg_parameters, path, stream_parameters, *args, **kwargs
+                        ),
+                        timeout=PROBE_TIMEOUT_LOCAL,
                     )
                 except Exception as exc:
                     name = type(exc).__name__

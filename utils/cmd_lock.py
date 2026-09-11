@@ -34,8 +34,10 @@ from __future__ import annotations
 import time
 from utils.tasks import spawn
 
-# (chat_id, command) → started_at  — currently running commands
-_inflight: "dict[tuple[int, str], float]" = {}
+# Most commands are serialized per chat. Queueable play commands are keyed
+# per user so one user's slow search/download cannot drop another user's /play.
+_inflight: "dict[tuple[int, str, int], float]" = {}
+_QUEUEABLE_PLAY_COMMANDS = {"play", "vplay", "cplay", "cvplay", "playforce", "vplayforce"}
 # (chat_id, user_id, command) → finished_at — anti double-tap
 _recent: "dict[tuple[int, int, str], float]" = {}
 # (chat_id, message_id) → seen_at — the ONE message that already took the lock
@@ -122,7 +124,8 @@ async def acquire(update) -> "tuple[bool, str | None]":
     if last is not None and now - last < COOLDOWN:
         return False, None  # silent: it is the user's own double tap
 
-    key = (chat_id, cmd)
+    lock_user_id = user_id if cmd in _QUEUEABLE_PLAY_COMMANDS else 0
+    key = (chat_id, cmd, lock_user_id)
     if key in _inflight:
         instant_ack(update)
         return False, None
@@ -131,16 +134,18 @@ async def acquire(update) -> "tuple[bool, str | None]":
     if msg_key[1]:
         _seen_messages[msg_key] = now
     instant_ack(update)
-    return True, f"{chat_id}|{cmd}"
+    return True, f"{chat_id}|{cmd}|{lock_user_id}"
 
 
 def release(key: "str | None", update=None) -> None:
     if not key:
         return
     try:
-        chat_str, cmd = key.split("|", 1)
-        _inflight.pop((int(chat_str), cmd), None)
+        chat_str, cmd, lock_user_str = key.split("|", 2)
+        chat_id = int(chat_str)
+        lock_user_id = int(lock_user_str)
+        _inflight.pop((chat_id, cmd, lock_user_id), None)
         user = getattr(update, "from_user", None)
-        _recent[(int(chat_str), getattr(user, "id", 0) or 0, cmd)] = time.monotonic()
+        _recent[(chat_id, getattr(user, "id", 0) or 0, cmd)] = time.monotonic()
     except Exception:  # noqa: BLE001
         pass

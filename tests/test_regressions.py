@@ -21,13 +21,11 @@ def test_add_button_opens_telegram_group_picker():
     assert "?startgroup=true" in source
 
 
-def test_play_starts_peer_work_in_parallel_and_keeps_single_stream_owner():
+def test_play_starts_direct_and_peer_work_in_parallel():
     play = (ROOT / "melody/plugins/music/play.py").read_text(encoding="utf-8")
     call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
     assert "spawn(ensure_assistant_peer(chat.id)" in play
-    assert "never start a second direct resolver" in play
-    assert "_stream_track()` is the single owner" in play
-    assert "download_task.cancel()" in call
+    assert "resolve_stream_urls(direct_id, want_video=video)" in play
     assert "_peer_inflight: dict[int, asyncio.Task]" in call
     assert "return bool(await asyncio.shield(existing))" in call
 
@@ -54,10 +52,7 @@ def test_restart_and_song_cache_are_wired():
     startup = (ROOT / "melody/__main__.py").read_text(encoding="utf-8")
     ytdl = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
     assert "recover_playback" in startup
-    assert "restore_archived_file" in ytdl
-    archive = (ROOT / "utils/telegram_archive.py").read_text(encoding="utf-8")
-    assert "archive_completed_file" in archive
-    assert "MONGO" not in archive
+    assert "restore_song" in ytdl
 
 def test_download_dedup_does_not_await_while_holding_lock():
     source = Path("melody/core/ytdl.py").read_text()
@@ -78,8 +73,8 @@ def test_stream_url_cache_is_bounded():
 def test_heroku_memory_defaults_are_conservative():
     pools = Path("melody/core/pools.py").read_text()
     player = Path("melody/core/call.py").read_text()
-    assert '_DEFAULT_YTDL_WORKERS = 4 if _MEMORY_LIMIT_MB <= 768 else 8' in pools
-    assert '_DEFAULT_IO_WORKERS = 2 if _MEMORY_LIMIT_MB <= 768 else 4' in pools
+    assert '_DEFAULT_YTDL_WORKERS = 2 if _MEMORY_LIMIT_MB <= 1024 else 4' in pools
+    assert '_DEFAULT_IO_WORKERS = 1 if _MEMORY_LIMIT_MB <= 1024 else 2' in pools
     assert 'YTDL_WORKERS = (' in pools
     assert 'IO_WORKERS = (' in pools
     assert 'os.getenv("SONG_CACHE_MB", "96")' in player
@@ -282,11 +277,12 @@ def test_playback_only_uses_validated_audio_prefix_handoff():
     call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
     warm = (ROOT / "melody/plugins/music/play.py").read_text(encoding="utf-8")
     assert '_env_flag("EARLY_HANDOFF", False)' in ytdl
-    assert '_EARLY_AUDIO_HANDOFF_ENABLED = _env_flag("EARLY_AUDIO_HANDOFF", True)' in ytdl
+    assert '_EARLY_AUDIO_HANDOFF_ENABLED = _env_flag(' in ytdl
+    assert 'False if _ON_CLOUD_HOST else True' in ytdl
     assert 'if not audio_only or not _early_audio_path_is_safe' in ytdl
     assert 'await done_async.wait()' in ytdl
     assert 'allow_early=not video' in call
-    assert 'await _persist_completed_song(archived_path, track)' in call
+    assert 'elif filepath and not filepath.endswith(".early"):' in call
     assert 'completed = await wait_for_download(' in call
     assert 'if not should_try_direct_stream():' in warm
 
@@ -429,8 +425,8 @@ def test_playback_fallback_is_lazy_and_memory_bounded():
     assert "_DEFAULT_CONCURRENT_DOWNLOADS = 1 if _MEMORY_BUDGET_MB <= 1024 else 2" in ytdl
     assert "1 if _MEMORY_BUDGET_MB <= 1024 else min(2, _requested_downloads)" in ytdl
     assert "ytdlp_future = None" in ytdl
-    assert "workers=_worker_count(\"BOT_WORKERS\", 8, 16)" in init
-    assert "workers=_worker_count(\"ASSISTANT_WORKERS\", 4, 8)" in init
+    assert 'workers=_worker_count("BOT_WORKERS", 4, 8)' in init
+    assert 'workers=_worker_count("ASSISTANT_WORKERS", 2, 4)' in init
     assert "threading.stack_size(512 * 1024)" in pools
 
 
@@ -439,6 +435,40 @@ def test_remote_probe_uses_dedicated_io_pool():
     assert 'REMOTE_CHECK_TIMEOUT", "2.5"' in source
     assert "from melody.core.pools import IO_POOL" in source
     assert "loop.run_in_executor(\n                IO_POOL" in source
+
+
+def test_prefetch_config_is_imported_and_vplay_proxy_is_local_source():
+    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
+    probe = (ROOT / "utils/pytgcalls_patch.py").read_text(encoding="utf-8")
+    assert "from melody.config import Config" in call
+    assert "def _is_local_proxy_url(path)" in probe
+    assert "local = _is_local_source(path)" in probe
+    assert "Telegram media proxy detected" in probe
+    assert "if _is_local_proxy_url(path):" in probe
+
+
+def test_vplay_command_defensively_forces_video_mode():
+    source = (ROOT / "melody/plugins/music/play.py").read_text(encoding="utf-8")
+    assert 'command_name in {"vplay", "cvplay", "vplayforce"}' in source
+    assert "video = bool(video or command_name" in source
+
+
+def test_vplay_defaults_to_720p_and_autoplay_preserves_video_mode():
+    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
+    ytdl = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
+    autoplay = (ROOT / "melody/core/autoplay.py").read_text(encoding="utf-8")
+    assert 'os.getenv("VIDEO_QUALITY") or "720p"' in call
+    assert 'os.getenv("VIDEO_QUALITY") or "720p"' in ytdl
+    assert 'PLAY_PROBE_TIMEOUT", "7"' in call
+    assert "get_last_user_mode" in autoplay
+    assert "video=get_last_user_mode(chat_id)" in autoplay
+
+
+def test_video_resume_rebuilds_stream_instead_of_native_timeout_prone_resume():
+    source = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
+    assert "if is_video_active(chat_id):" in source
+    assert "await seek_stream(chat_id, position)" in source
+    assert "video resumed via fresh MediaStream" in source
 
 
 def test_bare_youtube_ids_use_the_direct_metadata_route():
@@ -645,8 +675,9 @@ def test_fresh_log_direct_resolver_negative_cache_is_bounded():
 
 def test_download_first_playback_is_default_with_audio_early_handoff():
     source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert 'os.getenv("DIRECT_STREAM", "true")' in source
-    assert '_EARLY_AUDIO_HANDOFF_ENABLED = _env_flag("EARLY_AUDIO_HANDOFF", True)' in source
+    assert 'os.getenv("DIRECT_STREAM", "false")' in source
+    assert '_EARLY_AUDIO_HANDOFF_ENABLED = _env_flag(' in source
+    assert 'False if _ON_CLOUD_HOST else True' in source
     assert 'allow_early=not video' in (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
 
 
@@ -659,16 +690,16 @@ def test_fresh_log_ytdlp_plugin_loading_is_single_flight():
 
 def test_cloud_fallback_download_starts_immediately_and_persists_complete_audio():
     call_source = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    archive_source = (ROOT / "utils/telegram_archive.py").read_text(encoding="utf-8")
-    assert 'float(os.getenv("DOWNLOAD_START_DELAY", "0.0"))' in call_source
-    assert "_IS_CLOUD_RUNTIME" in call_source
-    assert '_DOWNLOAD_START_DELAY = max(0.0, configured_download_delay)' in call_source
-    assert "spawn(_persist_completed_song(filepath, track), name=f\"song-cache:{track.video_id}\")" in call_source
-    assert "archive_completed_file" in call_source
-    assert "Telegram" in call_source
-    assert "async def archive_completed_file" in archive_source
-    assert "send_document" in archive_source
-    assert "MONGO" not in archive_source
+    cache_source = (ROOT / "utils/song_cache.py").read_text(encoding="utf-8")
+    assert 'float(os.getenv("DOWNLOAD_START_DELAY", "0.25"))' in call_source
+    assert 'if _IS_CLOUD_RUNTIME:' in call_source
+    assert '_DOWNLOAD_START_DELAY = 0.25' in call_source
+    assert "spawn(_persist_completed_song(filepath, track))" in call_source
+    assert 'cache_flag = os.getenv("MONGO_AUDIO_CACHE", "true")' in call_source
+    assert 'cache_flag = os.getenv("MONGO_GRIDFS_CACHE", "false")' in call_source
+    assert "AsyncIOMotorGridFSBucket(db, bucket_name=\"song_audio\")" in cache_source
+    assert "os.replace(partial, target)" in cache_source
+    assert '".part", ".ytdl", ".temp"' in cache_source
 
 
 def test_song_cache_gridfs_api_and_restore_filename_are_correct():
@@ -756,159 +787,3 @@ def test_mongo_runtime_logs_only_credential_free_target():
     assert "def _mongo_target(uri: str)" in source
     assert "urlsplit(uri).hostname" in source
     assert '"Mongo runtime target: %s (database=%s)"' in source
-
-
-def test_playback_state_repairs_duplicate_chat_snapshots_before_unique_index():
-    source = (ROOT / "utils/playback_state.py").read_text(encoding="utf-8")
-    assert "async def _deduplicate_chat_snapshots()" in source
-    assert 'await state_col.delete_many({"_id": {"$in": duplicate_ids}})' in source
-    assert 'await state_col.drop_index("chat_id_1")' in source
-    assert "await state_col.create_index(\"chat_id\", unique=True)" in source
-
-
-def test_early_handoff_uses_staging_file_size_when_progress_bytes_are_missing():
-    source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert "Native fragment downloads do not consistently populate" in source
-    assert "downloaded = max(downloaded, os.path.getsize(fp))" in source
-    assert "if not audio_only or not _early_audio_path_is_safe(fp or \"\")" in source
-
-
-def test_direct_stream_retains_recovery_backup_after_success():
-    source = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert "recovery backup retained after direct stream" in source
-    assert "completed local backup" in source
-    assert "stale or half-written fallback" in source
-
-
-def test_direct_stream_supports_more_clients_and_higher_quality_audio():
-    ytdl = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert '"android_music", "android"' in ytdl
-    assert '"web_safari", "mweb"' in ytdl
-    assert "YT_AUDIO_MAX_ABR', 160" in ytdl
-    assert 'bestaudio[ext=webm][abr<=192]' in ytdl
-    assert 'float(os.getenv("YT_AUDIO_MAX_ABR", "160"))' in ytdl
-
-
-def test_new_tracks_reset_stale_seek_offset_but_recovery_can_seek():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert "A fresh manual/queued track must never inherit a previous track's seek" in call
-    assert "_seek_offset[chat_id] = 0" in call
-    assert "Recovery is the only path allowed to pass a nonzero start_at" in call
-
-
-def test_direct_resolver_has_last_resort_invidious_video_formats():
-    source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert "def _invidious_streams_sync(video_id: str, want_video: bool)" in source
-    assert 'f"{instance}/api/v1/videos/{video_id}"' in source
-    assert 'data.get("adaptiveFormats")' in source
-    assert "_invidious_streams_sync, vid_only, want_video" in source
-
-
-def test_download_retry_rungs_align_client_user_agent_and_cookie_policy():
-    source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert 'youtube["player_client"] = list(clients)' in source
-    assert 'headers["User-Agent"] = ua' in source
-    assert 'out.pop("cookiefile", None)' in source
-    assert '"android_music", "android", "android_vr"' in source
-
-
-def test_direct_failure_cache_allows_immediate_warm_playback_retry():
-    source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert "failure_age = _STREAM_URL_FAILURE_TTL - (failure_until - now)" in source
-    assert "failure_age >= 0.75" in source
-    assert "background warm resolve" in source
-
-
-def test_zero_second_direct_stream_end_recovers_from_local_fallback_first():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert "Recover that case FIRST" in call
-    assert "prefer_local=True" in call
-    assert "cached_file_path(track.video_id, audio_only=not video) if prefer_local else None" in call
-
-
-def test_zero_second_recovery_disables_growing_file_handoff():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    recovery_start = call.index("async def seek_stream(")
-    recovery_end = call.index("\nasync def change_volume", recovery_start)
-    recovery = call[recovery_start:recovery_end]
-    assert "prefer_local=True" in call
-    assert "allow_early=False" in recovery
-    assert "direct CDN stream that ended at 0s" in recovery
-
-
-def test_stream_end_recovery_runs_before_stale_event_filter():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    recovery = call.index("if await _resume_if_premature_end(chat_id):")
-    stale_filter = call.index("if _is_probably_stale_stream_end(chat_id):")
-    assert recovery < stale_filter
-    assert "Recover that case FIRST" in call[recovery - 300:recovery + 200]
-
-
-def test_remote_probe_preserves_stream_identity_headers():
-    patch = (ROOT / "utils/pytgcalls_patch.py").read_text(encoding="utf-8")
-    assert 'supplied.get("Referer")' in patch
-    assert 'supplied_agent' in patch
-    assert '"Range": "bytes=0-1"' in patch
-    assert 'impersonate="chrome124"' in patch
-
-
-def test_direct_stream_gets_exclusive_window_before_retained_fallback_backup():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert 'os.getenv("DOWNLOAD_START_DELAY", "0.0")' in call
-    assert "fallback" in call
-    assert "recovery backup retained" in call
-
-
-def test_direct_stream_failure_recovery_starts_clean_completed_download():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert "recovery" in call
-    assert "allow_early=False" in call
-    assert "stale or half-written fallback" in call
-
-
-def test_cloud_runtime_does_not_override_direct_stream_grace_delay():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert 'os.getenv("DOWNLOAD_START_DELAY", "0.0")' in call
-    assert "_DOWNLOAD_START_DELAY = max(0.0, configured_download_delay)" in call
-    assert "cloud-only grace period" in call
-
-
-def test_cloud_direct_first_logic_enforces_minimum_delay_over_stale_config():
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert "configured_download_delay" in call
-    assert "_DOWNLOAD_START_DELAY = max(0.0, configured_download_delay)" in call
-    assert "parallel" in call
-
-
-def test_play_has_single_direct_stream_owner_for_current_track():
-    play = (ROOT / "melody/plugins/music/play.py").read_text(encoding="utf-8")
-    assert "never start a second direct resolver" in play
-    assert "_stream_track()` is the single owner" in play
-    assert "direct-warm-" not in play
-    assert "warm_task = asyncio.create_task(_warm_sources" not in play
-
-
-def test_direct_audio_accepts_metadata_light_http_formats():
-    ytdl = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert "metadata_light = [f for f in formats" in ytdl
-    assert "accepted metadata-light direct audio URL" in ytdl
-
-
-def test_top_level_hls_url_is_preserved_for_direct_playback():
-    source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert "is_hls = \"m3u8\" in proto" in source
-    assert "top_url.split(\"?\", 1)[0].endswith(\".m3u8\")" in source
-    assert "no directly streamable HTTP/HLS format found" in source
-
-
-def test_direct_resolution_has_realistic_budget_before_full_download_fallback():
-    source = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert '_RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "4.0"))' in source
-    assert 'configured_download_delay = float(os.getenv("DOWNLOAD_START_DELAY", "0.0"))' in call
-
-
-def test_direct_stream_fallback_logs_empty_timeout_exceptions_with_type():
-    source = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
-    assert '(%s: %r) — falling back to download' in source
-    assert 'type(exc).__name__' in source

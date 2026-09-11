@@ -62,7 +62,7 @@ async def playlist_cmd(client: Client, message: Message):
     first_title = None
     first_playing = False
 
-    for info in entries:
+    for i, info in enumerate(entries):
         track = Track(
             video_id=info["id"],
             title=info["title"],
