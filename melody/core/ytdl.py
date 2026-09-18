@@ -1337,21 +1337,22 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # host, which is why stream= stayed at 3.2-3.6s). With cookies
         # present, ask only the two cookie/PO-token clients that work here.
         "player_client": (
-            # A single cookie-authenticated web_safari player call is enough
-            # on this host.  Asking tv_simply as well made yt-dlp wait for a
-            # second player response even after web_safari had exposed HLS.
-            ["web_safari"]
+            # ROOT-CAUSE FIX (Sep 18 2026): web_safari returns "Failed to
+            # extract any player response" because it needs a visitor_data /
+            # PO token that cannot be obtained when the webpage is skipped.
+            # android_vr has been 403'd entirely since Aug 17 2026.
+            # visionos is the current yt-dlp default: no PO token, no JS
+            # player, no bot-detection wall — it works from cloud IPs.
+            ["visionos", "web"]
             if has_cookies
-            else ["web_safari", "android_vr", "default", "ios"]
+            else ["visionos", "web"]
         ),
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.
-        # SPEED FIX: the watch page and its initial_data blob are only needed
-        # for comments/related metadata, never for picking a playback format —
-        # skipping them removes two HTTP round-trips (~0.6-1.2s on a dyno)
-        # from every cold resolve and every download.
-        "player_skip": ["configs", "initial_data", "webpage"],
+        # NOTE: "webpage" must NOT be skipped — the web client needs the
+        # initial player response from the watch page to succeed.
+        "player_skip": ["configs", "initial_data"],
         "skip": ["translated_subs"],
     }
 
@@ -2802,7 +2803,7 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 _DOWNLOAD_LADDER: tuple = (
     {},                                                        # as configured
     {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
-    {"_client": ["android_vr", "web_safari"]},                 # different API surface
+    {"_client": ["visionos", "web"]},                           # different API surface
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
     {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
                 "bestaudio[ext=m4a]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
@@ -2827,7 +2828,7 @@ _DOWNLOAD_LADDER: tuple = (
                 "bestaudio[format_id=251]/bestaudio[format_id=250]/bestaudio[format_id=249]/"
                 "bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "concurrent_fragment_downloads": 1, "_no_merge": True},
-    {"_client": ["web_safari", "web_embedded"],
+    {"_client": ["visionos", "web_embedded"],
      "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
                 "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
                 "bestaudio[format_id=251]/bestaudio[format_id=140]/"
@@ -2858,6 +2859,8 @@ def _apply_ladder_step(opts: dict, step: dict, audio_only: bool) -> dict:
             ua = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X)"
         elif client in {"android", "android_music", "android_vr"}:
             ua = "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"
+        elif client == "visionos":
+            ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
         elif client in {"tv", "tv_simply"}:
             ua = "Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.5) AppleWebKit/537.36 TV Safari/537.36"
         else:
@@ -2865,7 +2868,7 @@ def _apply_ladder_step(opts: dict, step: dict, audio_only: bool) -> dict:
         headers = dict(out.get("http_headers") or {})
         headers["User-Agent"] = ua
         out["http_headers"] = headers
-        if client not in {"web", "web_safari", "mweb", "web_embedded"}:
+        if client not in {"web", "web_safari", "mweb", "web_embedded", "visionos"}:
             # Browser cookies minted for desktop web are often rejected when
             # replayed with a mobile/TV client and can turn a valid media URL
             # into HTTP 403. Those client APIs are designed to work without
@@ -4410,12 +4413,13 @@ def _innertube_player_sync(video_id: str) -> "dict | None":
 
     _PLAYER_URL = "https://www.youtube.com/youtubei/v1/player"
 
-    # MODERNISED: keyless InnerTube; the plain ANDROID client (404 on every
-    # call today) replaced by ANDROID_VR, which still answers with full
-    # videoDetails and needs no PO token.
+    # ROOT-CAUSE FIX (Sep 18 2026): ANDROID_VR has been 403'd entirely since
+    # Aug 17 2026. VISIONOS is the new keyless client that still answers with
+    # full videoDetails and needs no PO token, no JS player.
     _CLIENT_CONTEXTS = [
-        ("ANDROID_VR", "1.62.27",
-         "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12) gzip"),
+        ("VISIONOS", "1.02",
+         "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 "
+         "(KHTML, like Gecko) Version/26.0 Safari/605.1.15"),
         ("WEB", "2.20260801.00.00",
          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
          "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
@@ -4426,6 +4430,11 @@ def _innertube_player_sync(video_id: str) -> "dict | None":
                       "hl": "en", "gl": "US", "utcOffsetMinutes": 0}
         if client_name.startswith("ANDROID"):
             client_ctx["androidSdkVersion"] = 32
+        elif client_name == "VISIONOS":
+            client_ctx["deviceMake"] = "Apple"
+            client_ctx["deviceModel"] = "RealityDevice17,1"
+            client_ctx["osName"] = "visionOS"
+            client_ctx["osVersion"] = "26.5.23O471"
         payload = json.dumps({
             "context": {"client": client_ctx},
             "videoId": video_id,
@@ -4489,7 +4498,7 @@ _IT_WEB_UA = (
 _CLIENT_IDS = {
     "WEB_REMIX": "67", "TVHTML5_SIMPLY_EMBEDDED_PLAYER": "85",
     "IOS": "5", "IOS_MUSIC": "26", "ANDROID_MUSIC": "21",
-    "ANDROID": "3", "ANDROID_VR": "28",
+    "ANDROID": "3", "ANDROID_VR": "28", "VISIONOS": "101",
     "TVHTML5": "7", "MWEB": "2", "WEB": "1", "WEB_EMBEDDED_PLAYER": "56",
 }
 
@@ -4686,9 +4695,11 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         ("ANDROID", "20.10.38",
          "com.google.android.youtube/20.10.38 (Linux; U; Android 14)",
          {"androidSdkVersion": 34}),
-        ("ANDROID_VR", "1.62.27",
-         "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12) gzip",
-         {"androidSdkVersion": 32}),
+        ("VISIONOS", "1.02",
+         "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 "
+         "(KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+         {"deviceMake": "Apple", "deviceModel": "RealityDevice17,1",
+          "osName": "visionOS", "osVersion": "26.5.23O471"}),
         # Web-family clients only help when YT_COOKIES is configured (the
         # session cookie is what lifts LOGIN_REQUIRED on datacenter IPs), so
         # they are skipped otherwise instead of burning a request + timeout
@@ -4720,7 +4731,7 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
     # resolve. They are off the critical path now (opt back in with
     # INNERTUBE_WEB_CLIENTS=true), and the cookie-less mobile clients — which
     # need no visitorData, no PO token and no session round-trips — go first.
-    _MOBILE_ORDER = ("IOS", "ANDROID", "ANDROID_MUSIC", "IOS_MUSIC", "ANDROID_VR")
+    _MOBILE_ORDER = ("IOS", "ANDROID", "ANDROID_MUSIC", "IOS_MUSIC", "VISIONOS")
     _by_name = {c[0]: c for c in _CLIENTS}
 
     session = {"visitor": "", "pot": ""}
