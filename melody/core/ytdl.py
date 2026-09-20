@@ -4767,20 +4767,25 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
 
     session = {"visitor": "", "pot": ""}
     if cookie_header:
-        # SPEED FIX (Sep 11 production logs): all five anonymous mobile
-        # clients answer LOGIN_REQUIRED on this host.  A real YT_COOKIES
-        # session can ask WEB directly and often receives its HLS manifest in
-        # one player call (~300 ms), before the heavier yt-dlp fallback starts.
-        # Probe only WEB here: launching mobile and WEB_REMIX requests too
-        # merely competes for the small worker pool and repeats known failures.
-        # Sep 20 fix: if WEB is per-client muted, fall through to mobile clients
-        # instead of returning an empty list (which killed the fast path for 300s).
-        if _innertube_client_muted("WEB"):
-            session = {"visitor": "", "pot": ""}
-            _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name and not _innertube_client_muted(n)]
+        # SPEED FIX (Sep 20 production logs — "gana 4-5 sec ke andar nahi baj
+        # raha"): with YT_COOKIES configured the code probed ONLY the WEB client.
+        # On this datacenter IP WEB answers UNPLAYABLE ("Video unavailable")
+        # every single time (see log line 68/84), so InnerTube returned None,
+        # the resolve fell through to yt-dlp, and the song started in 7-8s
+        # instead of <1s. The mobile clients (IOS, ANDROID) succeed in ~0.2s
+        # WITHOUT cookies — cookies are only attached to web-family clients
+        # inside _probe() (line ~4821), so probing them concurrently is safe
+        # and does not change their behaviour. Race WEB (for the cookie
+        # session that may still work for some videos) alongside the mobile
+        # clients so the fastest usable response wins instead of waiting for
+        # WEB to fail and then paying the yt-dlp tax.
+        session = _innertube_session()
+        mobile = [_by_name[n] for n in _MOBILE_ORDER
+                  if n in _by_name and not _innertube_client_muted(n)]
+        if not _innertube_client_muted("WEB"):
+            _CLIENTS = [("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {})] + mobile
         else:
-            session = _innertube_session()
-            _CLIENTS = [("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {})]
+            _CLIENTS = mobile
     else:
         _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name and not _innertube_client_muted(n)]
 
