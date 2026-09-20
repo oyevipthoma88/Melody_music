@@ -1380,7 +1380,21 @@ def _ydl_opts(audio_only: bool = True) -> dict:
             # download grabs a huge video file (13-14s). Adding ios gives
             # yt-dlp access to unciphered audio-only m4a (itag 140, ~3MB) that
             # streams directly AND downloads in ~2s.
-            ["ios", "visionos", "web"]
+            #
+            # ROOT-CAUSE FIX (Sep 20 2026 05:13 log: "#download rung 1 picked
+            # format_id=18 ... size=18580114", stream=16.68s): a cookiefile is
+            # attached to these very opts below, and browser web cookies
+            # replayed to the ios/visionos app clients make YouTube answer
+            # "Sign in to confirm you're not a bot" — the same reason
+            # _apply_ladder_step() pops the cookiefile for mobile rungs. With
+            # every mobile client refused, the only surviving format was the
+            # muxed itag 18, hence the audio-less direct URL and the 18 MB
+            # download. When cookies are present ask the cookie-compatible
+            # web/TV clients (they expose audio-only itag 140/251 with a valid
+            # session); the cookie-less mobile clients stay available through
+            # the download ladder rungs, which drop the cookiefile first.
+            ["web_safari", "web", "tv"] if has_cookies
+            else ["ios", "visionos", "web"]
         ),
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
@@ -4821,27 +4835,31 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         if client_name.startswith("TVHTML5") or client_name == "WEB_EMBEDDED_PLAYER":
             body["context"]["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
         is_web = client_name in _WEB_FAMILY
-        # ROOT-CAUSE FIX #2 (Sep 20 2026, live probe from a datacenter IP):
-        # attaching the *web-bound* PO token to the mobile clients is what
-        # made IOS / ANDROID / *_MUSIC / VISIONOS answer LOGIN_REQUIRED on
-        # every single track. A PO token is bound to the session AND the
-        # client that minted it; a web token presented by the iOS app is a
-        # mismatch, and YouTube answers "Sign in to confirm you're not a
-        # bot". Verified: bare IOS/ANDROID -> OK with 21-23 unciphered URLs,
-        # IOS + visitorData -> still OK, IOS + web PO token -> LOGIN_REQUIRED.
-        # So: visitorData goes to every client (harmless and keeps the
-        # streaming URLs session-consistent), the PO token goes to the web
-        # family only.
-        if session.get("visitor"):
+        # ROOT-CAUSE FIX #3 (Sep 20 2026 05:13 production log — EVERY client,
+        # mobile included, answered `LOGIN_REQUIRED (Sign in to confirm you're
+        # not a bot)` / `Please sign in`, InnerTube returned no format, the
+        # direct CDN URL that yt-dlp then produced was an audio-less itag 18
+        # (NoAudioSourceFound) and /play paid a full 18 MB download → 17s):
+        # the previous fix attached the WEB-minted `visitorData` (from
+        # /youtubei/v1/visitor_id, i.e. a web session token) to the IOS /
+        # ANDROID / *_MUSIC / VISIONOS probes as well. YouTube binds
+        # visitorData to the client family that minted it and now rejects the
+        # mismatch on the mobile app clients exactly like a mismatched PO
+        # token does. The mobile clients need NO session at all — bare probes
+        # answer OK in ~0.2s with unciphered CDN URLs (see the live-probe
+        # table above). So the whole web session (visitorData + PO token +
+        # SAPISIDHASH + cookies) is now web-family only, and mobile clients
+        # are sent completely bare.
+        if is_web and session.get("visitor"):
             ctx["visitorData"] = session["visitor"]
-            if is_web and session.get("pot"):
+            if session.get("pot"):
                 body["serviceIntegrityDimensions"] = {"poToken": session["pot"]}
         payload = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "User-Agent": ua,
                    "X-Youtube-Client-Name": _CLIENT_IDS.get(client_name, "1"),
                    "X-Youtube-Client-Version": client_ver,
                    "Origin": "https://www.youtube.com"}
-        if session.get("visitor"):
+        if is_web and session.get("visitor"):
             headers["X-Goog-Visitor-Id"] = session["visitor"]
         if is_web and session.get("visitor"):
             headers["X-Origin"] = "https://www.youtube.com"
