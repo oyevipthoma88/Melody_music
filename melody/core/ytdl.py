@@ -1231,13 +1231,26 @@ else:
 
 # Terminal fallback used whenever NO audio-only format exists (HLS-only
 # extractions on blocked cloud IPs). Plain `best` there means a 1080p muxed
-# file of 60-95 MB and a 10s wait; the smallest muxed rendition carries the
-# same AAC audio in a few MB. Ordered smallest-usable first, `best` last so
-# the selector can never fail outright.
+# file of 60-95 MB and a 10s wait, so a small muxed rendition is still the
+# right trade — but NOT the smallest one.
+#
+# QUALITY FIX (Sep 20 2026 05:27 log: "#download rung 1 picked format_id=91"
+# on every single track, user report "quality kharab"): the old chain asked
+# for height<=144 first, i.e. HLS itag 91, whose audio track is 48 kbps
+# HE-AAC v1 — audibly the worst rendition YouTube ships. The muxed ladder is
+# now ordered by AUDIO bitrate instead of by picture size: itag 93/94 carry
+# 128 kbps AAC-LC, progressive itag 18 carries ~96 kbps, and 92/91 (48 kbps)
+# are only reached when nothing better exists. The extra few MB cost ~1s on
+# a Heroku dyno and the voice chat finally gets a proper stereo source.
 _SMALL_MUXED_SELECTOR = (
-    "best[acodec!=none][height<=144]/"
-    "best[acodec!=none][height<=240]/"
-    "best[acodec!=none][height<=360]/"
+    "best[acodec!=none][format_id=93]/"
+    "best[acodec!=none][format_id=94]/"
+    "best[acodec!=none][format_id=18]/"
+    "best[acodec!=none][format_id=95]/"
+    "best[acodec!=none][abr>=96]/"
+    "best[acodec!=none][height<=480]/"
+    "best[acodec!=none][height<=720]/"
+    "best[acodec!=none]/"
     "worst[acodec!=none]/worst/best"
 )
 
@@ -1287,6 +1300,12 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # m4a (itag 140/139) is fragmented MP4 with headers FIRST, is ~5% of
         # the bytes, and is moov-verified before early handoff below.
         "bestaudio[ext=m4a]/bestaudio[format_id=140]/bestaudio[format_id=139]/"
+        # QUALITY FIX (Sep 20 2026): on HLS-only cloud extractions the master
+        # playlist carries audio-only renditions too — itag 234 is 128 kbps
+        # AAC-LC, itag 233 only 48 kbps. Name 234 explicitly so the generic
+        # m3u8 branch below can never settle on the 48 kbps one, and so a
+        # muxed 144p variant is never reached while real audio exists.
+        "bestaudio[format_id=234]/bestaudio[vcodec=none][abr>=96]/"
         "bestaudio[protocol=m3u8]/bestaudio[protocol=m3u8_native]/"
         # Catch-all for audio-only formats yt-dlp exposes without an `abr`
         # or a recognised ext (bestaudio* also matches HLS audio renditions).
@@ -2708,12 +2727,14 @@ def _mpegts_at_head(path: str) -> bool:
 
 def _early_audio_file_is_safe(path: str) -> bool:
     """Path-based container check plus a moov-at-head sniff for m4a."""
+    # A per-fragment scratch file is never a playable stream, whatever its
+    # bytes look like — see is_fragment_temp_path().
+    if is_fragment_temp_path(path):
+        return False
     if not _early_audio_path_is_safe(path):
         # The extension lies on HLS extractions; trust the bytes instead.
         return _mpegts_at_head(path)
     name = os.path.basename(path or "").lower()
-    name = re.sub(r"\.part-frag\d+$", "", name)
-    name = re.sub(r"\.frag\d+$", "", name)
     for suffix in (".part", ".ytdl", ".temp"):
         while name.endswith(suffix):
             name = name[: -len(suffix)]
@@ -2742,17 +2763,35 @@ def _early_handoff_ready(downloaded: int, total: int = 0) -> bool:
     return downloaded >= required
 
 
-def _early_audio_path_is_safe(path: str) -> bool:
-    """Return True only for containers whose prefix is probeable/playable.
+_FRAGMENT_TEMP_RE = re.compile(r"\.part-frag\d+|\.frag\d+")
 
-    yt-dlp/native fragment downloads can expose temporary names like
-    ``file.webm.part-Frag159`` instead of ``file.webm.part``. Those are still
-    WebM bytes, but the old suffix-only cleanup rejected them and made the
-    playback caller wait for the complete download.
+
+def is_fragment_temp_path(path: str) -> bool:
+    """True for yt-dlp's PER-FRAGMENT scratch files.
+
+    ROOT CAUSE of "gana bich me se start hota hai aur khatam ho jata hai"
+    (Sep 20 2026 05:27 log: "early audio handoff (watcher) ...
+    path=file.mp4.part-Frag4.part", then the track died seconds later):
+    yt-dlp's native fragment downloader writes EACH fragment to its own
+    ``<final>.part-FragN`` / ``<final>.part-FragN.part`` scratch file and only
+    afterwards appends it to the single growing ``<final>.part``. Handing a
+    ``Frag4`` file to the voice chat therefore plays fragment number four in
+    isolation: playback starts in the middle of the song and ends as soon as
+    that one fragment (a few seconds of audio) runs out — and the file is then
+    deleted under ffmpeg's feet.
+
+    Only the growing final output (``<final>`` or ``<final>.part``) is a
+    continuous stream from second zero, so per-fragment scratch files are
+    never eligible for early handoff.
     """
+    return bool(_FRAGMENT_TEMP_RE.search(os.path.basename(path or "").lower()))
+
+
+def _early_audio_path_is_safe(path: str) -> bool:
+    """Return True only for containers whose prefix is probeable/playable."""
+    if is_fragment_temp_path(path):
+        return False
     name = os.path.basename(path or "").lower()
-    name = re.sub(r"\.part-frag\d+$", "", name)
-    name = re.sub(r"\.frag\d+$", "", name)
     for suffix in (".part", ".ytdl", ".temp"):
         while name.endswith(suffix):
             name = name[: -len(suffix)]
@@ -3210,7 +3249,17 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
             if early_event is None or early_event.is_set():
                 return
             try:
-                candidates = glob.glob(os.path.join(attempt_dir, "*"))
+                candidates = [
+                    c for c in glob.glob(os.path.join(attempt_dir, "*"))
+                    # Per-fragment scratch files (``*.part-FragN``) are not a
+                    # continuous stream — playing one starts the song in the
+                    # middle and ends it after a few seconds.
+                    if not is_fragment_temp_path(c)
+                ]
+                # Largest first: that is the single growing final output, never
+                # a leftover scrap.
+                candidates.sort(key=lambda c: os.path.getsize(c) if os.path.exists(c) else 0,
+                                reverse=True)
             except OSError:
                 continue
             for cand in candidates:
@@ -5570,18 +5619,61 @@ def _pick_stream_formats_primary(info: dict, want_video: bool) -> dict:
             return {"audio": best_dash["url"], "video": None}
         
         # If YouTube exposes an HLS manifest but no audio-only HTTPS format,
-        # prefer the manifest over a WEB progressive itag (usually 18). The
-        # latter can be a large muxed MP4 whose signed googlevideo URL is
-        # rejected from cloud IPs, forcing a full download; HLS is designed for
-        # progressive playback and avoids that multi-second fallback.
+        # prefer HLS over a WEB progressive itag (usually 18). The latter can
+        # be a large muxed MP4 whose signed googlevideo URL is rejected from
+        # cloud IPs, forcing a full download; HLS is designed for progressive
+        # playback and avoids that multi-second fallback.
+        #
+        # QUALITY + LAG FIX (Sep 20 2026 05:27 log: every play streamed the
+        # bare master playlist, user report "quality kharab, bohot lag"):
+        # handing ffmpeg the MASTER playlist lets ffmpeg choose, and it takes
+        # the FIRST variant listed — YouTube lists the smallest first (itag
+        # 91: 144p video + 48 kbps HE-AAC). So the voice chat got the worst
+        # audio YouTube ships *and* paid for a video track it throws away.
+        # Pick the rendition ourselves: audio-only renditions first (highest
+        # bitrate), then a mid muxed variant (<=480p carries 128 kbps AAC),
+        # and only use the master playlist when nothing is enumerable.
+        def _hls_audio_rate(f) -> float:
+            try:
+                return float(f.get("abr") or f.get("tbr") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _hls_height(f) -> int:
+            try:
+                return int(f.get("height") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        if not audio_pick and hls_formats:
+            hls_audio_only = [
+                f for f in hls_formats
+                if f.get("vcodec") in (None, "none")
+                and f.get("acodec") not in (None, "none")
+                and f.get("url")
+            ]
+            if hls_audio_only:
+                best_hls = max(hls_audio_only, key=_hls_audio_rate)
+                LOGGER.info(
+                    "#stream selected HLS audio-only rendition (abr=%s)",
+                    best_hls.get("abr") or best_hls.get("tbr"),
+                )
+                return {"audio": best_hls["url"], "video": None}
+            playable = [f for f in hls_formats if f.get("url")]
+            mid = [f for f in playable if 0 < _hls_height(f) <= 480]
+            if mid:
+                best_hls = max(mid, key=_hls_audio_rate)
+                LOGGER.info(
+                    "#stream selected HLS variant %sp (tbr=%s) — master playlist"
+                    " would have given the 48 kbps 144p rendition",
+                    _hls_height(best_hls), best_hls.get("tbr"),
+                )
+                return {"audio": best_hls["url"], "video": None}
+            if playable:
+                return {"audio": playable[0]["url"], "video": None}
         hls_manifest = info.get("hlsManifestUrl")
         if not audio_pick and hls_manifest:
             return {"audio": hls_manifest, "video": None}
-        if not audio_pick and hls_formats:
-            # Some cloud responses expose only an HLS format entry and omit
-            # the top-level manifest field. It is still a valid progressive
-            # source for FFmpeg, so do not force a complete download.
-            return {"audio": hls_formats[0]["url"], "video": None}
         # ROOT-CAUSE FIX ("/play karta hu to vplay ho raha hai + bohot lag"):
         # this used to fall back to a MUXED (video+audio) format when no
         # audio-only http format was listed. Handing PyTgCalls a 720p muxed
