@@ -67,10 +67,19 @@ except Exception:  # noqa: BLE001
     _IT_MUTE_TTL = 300.0
 _it_stream_fail_streak = 0
 _it_stream_muted_until = 0.0
+# Per-client mute tracking — a WEB failure should NOT mute IOS
+_it_client_failures: dict = {}
+_it_client_muted: dict = {}
 
 
 def _innertube_stream_muted() -> bool:
     return _it_stream_muted_until > _time_mod.monotonic()
+
+
+def _innertube_client_muted(client: str) -> bool:
+    """Check if a SPECIFIC InnerTube client is muted (per-client, not global)."""
+    until = _it_client_muted.get(client, 0.0)
+    return until > _time_mod.monotonic()
 
 
 def direct_stream_muted() -> bool:
@@ -92,7 +101,12 @@ def direct_stream_muted() -> bool:
 
 
 def _note_innertube_stream(ok: bool) -> None:
-    """Track consecutive host-level InnerTube direct-stream failures."""
+    """Track consecutive host-level InnerTube direct-stream failures.
+
+    NOTE (Sep 20 fix): this global mute is kept for backward compatibility but
+    the per-client mute (_note_innertube_client) is what actually gates which
+    clients are probed. A WEB failure no longer mutes IOS.
+    """
     global _it_stream_fail_streak, _it_stream_muted_until
     if ok:
         if _it_stream_muted_until or _it_stream_fail_streak:
@@ -101,12 +115,31 @@ def _note_innertube_stream(ok: bool) -> None:
         _it_stream_muted_until = 0.0
         return
     _it_stream_fail_streak += 1
-    if _it_stream_fail_streak >= _IT_MUTE_AFTER and not _innertube_stream_muted():
+    # Global mute only after many failures (not 2) — per-client mute handles individual dead clients
+    if _it_stream_fail_streak >= max(_IT_MUTE_AFTER * 3, 6) and not _innertube_stream_muted():
         _it_stream_muted_until = _time_mod.monotonic() + _IT_MUTE_TTL
         LOGGER.info(
-            "#stream innertube blocked on this host (%d/%d) — skipping direct "
-            "InnerTube probes for %.0fs, using cookie yt-dlp first",
-            _it_stream_fail_streak, _IT_MUTE_AFTER, _IT_MUTE_TTL,
+            "#stream innertube globally blocked on this host (%d failures) — "
+            "skipping all InnerTube probes for %.0fs",
+            _it_stream_fail_streak, _IT_MUTE_TTL,
+        )
+
+
+def _note_innertube_client(client: str, ok: bool) -> None:
+    """Track per-client InnerTube failures — mute only the failing client."""
+    if ok:
+        if _it_client_muted.get(client) or _it_client_failures.get(client, 0):
+            LOGGER.info("#stream innertube client %s healthy again", client)
+        _it_client_failures.pop(client, None)
+        _it_client_muted.pop(client, None)
+        return
+    fails = _it_client_failures.get(client, 0) + 1
+    _it_client_failures[client] = fails
+    if fails >= _IT_MUTE_AFTER and client not in _it_client_muted:
+        _it_client_muted[client] = _time_mod.monotonic() + _IT_MUTE_TTL
+        LOGGER.info(
+            "#stream innertube client %s muted after %d failures — skipping for %.0fs",
+            client, fails, _IT_MUTE_TTL,
         )
 
 # How long the fast metadata race (YouTube Data API v3 + InnerTube) is given
@@ -1337,15 +1370,13 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # host, which is why stream= stayed at 3.2-3.6s). With cookies
         # present, ask only the two cookie/PO-token clients that work here.
         "player_client": (
-            # ROOT-CAUSE FIX (Sep 18 2026): web_safari returns "Failed to
-            # extract any player response" because it needs a visitor_data /
-            # PO token that cannot be obtained when the webpage is skipped.
-            # android_vr has been 403'd entirely since Aug 17 2026.
-            # visionos is the current yt-dlp default: no PO token, no JS
-            # player, no bot-detection wall — it works from cloud IPs.
-            ["visionos", "web"]
-            if has_cookies
-            else ["visionos", "web"]
+            # ROOT-CAUSE FIX (Sep 20 2026): visionos alone only returns muxed
+            # 360p (itag 18, 10-21MB) — no audio-only formats, so the direct
+            # stream URL has no clean audio track (NoAudioSourceFound) and the
+            # download grabs a huge video file (13-14s). Adding ios gives
+            # yt-dlp access to unciphered audio-only m4a (itag 140, ~3MB) that
+            # streams directly AND downloads in ~2s.
+            ["ios", "visionos", "web"]
         ),
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
@@ -2803,7 +2834,7 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 _DOWNLOAD_LADDER: tuple = (
     {},                                                        # as configured
     {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
-    {"_client": ["visionos", "web"]},                           # different API surface
+    {"_client": ["ios", "visionos", "web"]},                      # different API surface
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
     {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
                 "bestaudio[ext=m4a]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
@@ -2828,7 +2859,7 @@ _DOWNLOAD_LADDER: tuple = (
                 "bestaudio[format_id=251]/bestaudio[format_id=250]/bestaudio[format_id=249]/"
                 "bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "concurrent_fragment_downloads": 1, "_no_merge": True},
-    {"_client": ["visionos", "web_embedded"],
+    {"_client": ["ios", "visionos", "web_embedded"],
      "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
                 "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
                 "bestaudio[format_id=251]/bestaudio[format_id=140]/"
@@ -4742,10 +4773,16 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         # one player call (~300 ms), before the heavier yt-dlp fallback starts.
         # Probe only WEB here: launching mobile and WEB_REMIX requests too
         # merely competes for the small worker pool and repeats known failures.
-        session = _innertube_session()
-        _CLIENTS = [("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {})]
+        # Sep 20 fix: if WEB is per-client muted, fall through to mobile clients
+        # instead of returning an empty list (which killed the fast path for 300s).
+        if _innertube_client_muted("WEB"):
+            session = {"visitor": "", "pot": ""}
+            _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name and not _innertube_client_muted(n)]
+        else:
+            session = _innertube_session()
+            _CLIENTS = [("WEB", _IT_WEB_VERSION, _IT_WEB_UA, {})]
     else:
-        _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name]
+        _CLIENTS = [_by_name[n] for n in _MOBILE_ORDER if n in _by_name and not _innertube_client_muted(n)]
 
     def _probe(entry):
         client_name, client_ver, ua, extra = entry
@@ -4806,11 +4843,11 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
             # UNPLAYABLE the direct path silently dies and every song falls
             # back to a full download. That is exactly the "gana late bajta
             # hai" symptom, and the logs used to show nothing about it.
-            # Log the reason too — "LOGIN_REQUIRED" alone hid whether the
-            # session was stale or the client itself is simply dead now.
             LOGGER.info("#stream innertube %s for %s -> %s (%s)", client_name, video_id,
                         status or "?",
                         str((data.get("playabilityStatus") or {}).get("reason") or "")[:60])
+            # Per-client mute: only mute THIS client, not all of them
+            _note_innertube_client(client_name, False)
             if status == "LOGIN_REQUIRED" and is_web:
                 # Refresh visitorData + PO token in the background so the next
                 # track gets a working session instead of muting the fast path.
@@ -4865,6 +4902,7 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
                 LOGGER.debug("InnerTube %s: no unciphered format for %s, trying next client", 
                            client_name, video_id)
                 return None
+        _note_innertube_client(client_name, True)
         return {"formats": formats,
                 "client": client_name,
                 "headers": {
