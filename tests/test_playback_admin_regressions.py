@@ -590,3 +590,53 @@ def test_command_registration_recovers_from_telegram_command_limit():
     assert "BOT_COMMANDS_TOO_MUCH" in source
     assert "retrying with 100-entry menu" in source
     assert "_set_commands_safely" in source
+
+
+def test_early_handoff_never_plays_a_single_fragment_file():
+    """A per-fragment scratch file must never reach the voice chat.
+
+    Sep 20 2026 05:27 log: "early audio handoff (watcher) ...
+    path=file.mp4.part-Frag4.part" — fragment #4 alone, so the song started in
+    the middle and ended after a few seconds ("gana bich me se start hota hai,
+    khatam hojata"). Only the single growing final output is continuous.
+    """
+    import importlib.util
+    import pathlib
+
+    source_path = pathlib.Path(__file__).resolve().parents[1] / "melody" / "core" / "ytdl.py"
+    source = source_path.read_text(encoding="utf-8")
+    assert "def is_fragment_temp_path(path: str) -> bool:" in source
+    assert "if is_fragment_temp_path(path):\n        return False" in source
+    assert "if not is_fragment_temp_path(c)" in source
+    # The old permissive behaviour (stripping the fragment suffix so the
+    # fragment file passed the container check) must be gone.
+    assert 'name = re.sub(r"\\.part-frag\\d+$", "", name)' not in source
+
+    namespace: dict = {"os": __import__("os"), "re": __import__("re")}
+    start = source.index("_FRAGMENT_TEMP_RE = re.compile")
+    end = source.index("def _early_audio_path_is_safe")
+    exec(compile(source[start:end], str(source_path), "exec"), namespace)
+    is_fragment_temp_path = namespace["is_fragment_temp_path"]
+    assert is_fragment_temp_path("/tmp/x/file.mp4.part-Frag4.part") is True
+    assert is_fragment_temp_path("/tmp/x/file.webm.part-Frag159") is True
+    assert is_fragment_temp_path("/tmp/x/file.webm.part") is False
+    assert is_fragment_temp_path("/tmp/x/file.webm") is False
+    assert importlib.util.find_spec is not None
+
+
+def test_audio_fallback_prefers_audio_bitrate_over_tiny_picture():
+    """itag 91 (48 kbps HE-AAC) must not be the first muxed choice."""
+    source = _source("melody/core/ytdl.py")
+    assert '"best[acodec!=none][format_id=93]/"' in source
+    assert '"best[acodec!=none][height<=144]/"' not in source
+    assert '"bestaudio[format_id=234]/bestaudio[vcodec=none][abr>=96]/"' in source
+
+
+def test_direct_hls_picks_a_rendition_instead_of_the_master_playlist():
+    """ffmpeg takes the first (worst) variant of a master playlist."""
+    source = _source("melody/core/ytdl.py")
+    assert "#stream selected HLS audio-only rendition (abr=%s)" in source
+    assert "mid = [f for f in playable if 0 < _hls_height(f) <= 480]" in source
+    hls_block = source.index("hls_audio_only = [")
+    manifest_fallback = source.index('hls_manifest = info.get("hlsManifestUrl")\n        if not audio_pick and hls_manifest:')
+    assert hls_block < manifest_fallback, "manifest must stay the LAST resort"
