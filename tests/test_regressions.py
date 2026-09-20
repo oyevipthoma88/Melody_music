@@ -905,7 +905,10 @@ def test_no_audio_cdn_url_is_blacklisted_instead_of_being_re_picked():
     assert "def note_no_audio_url(" in ytdl
     assert "_NO_AUDIO_URLS" in ytdl
     assert "_url_has_no_audio(f[\"url\"])" in ytdl
-    assert "no audio source" in call
+    # Contract change: py-tgcalls raises NoAudioSourceFound for a refused URL
+    # too, so only a CONFIRMED audio-less source (NoAudioTrack) is blacklisted.
+    assert 'type(play_exc).__name__ == "NoAudioTrack"' in call
+    assert "note_no_audio_url(" in call
     assert "note_no_audio_url" in call
     assert "_melody_audio_url" in call
     # Mirror-proof blacklist + alternate-source retry before any re-resolve.

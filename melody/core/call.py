@@ -1167,6 +1167,7 @@ apply_pytgcalls_probe_patch()
 
 _PROBE_ERROR_NAMES = (
     "StreamProbeUnavailable",
+    "NoAudioTrack",
     "JSONDecodeError",
     "ProcessLookupError",
     "TimeoutError",
@@ -1960,7 +1961,14 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 # track. Blacklist it before re-resolving, otherwise the
                 # forced retry picks the identical itag, fails again, and the
                 # whole probe budget is wasted before the fallback starts.
-                if "no audio source" in str(play_exc).lower():
+                # ROOT-CAUSE FIX (Heroku: every /play of a given video paid a
+                # 13-20s download after ONE probe failure): py-tgcalls raises
+                # NoAudioSourceFound both for a real video-only stream AND for
+                # a URL the CDN refused, so a blocked-but-perfect audio itag was
+                # blacklisted for 15 minutes and re-resolves kept discarding it.
+                # Only a CONFIRMED audio-less source (NoAudioTrack, verified by
+                # our own header-corrected ffprobe) is remembered now.
+                if type(play_exc).__name__ == "NoAudioTrack":
                     try:
                         from melody.core.ytdl import note_no_audio_url
 
@@ -2003,7 +2011,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                             )
                             break
                         except Exception as alt_exc:  # noqa: BLE001
-                            if "no audio source" in str(alt_exc).lower():
+                            if type(alt_exc).__name__ == "NoAudioTrack":
                                 try:
                                     from melody.core.ytdl import note_no_audio_url
 

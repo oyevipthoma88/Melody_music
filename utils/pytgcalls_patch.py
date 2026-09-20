@@ -171,6 +171,192 @@ class StreamProbeUnavailable(Exception):
     """ffprobe could not read the media source (dead/blocked CDN URL)."""
 
 
+class NoAudioTrack(StreamProbeUnavailable):
+    """The source was READ successfully and genuinely carries no audio.
+
+    Distinguishing this from "ffprobe could not read the URL at all" is the
+    whole point: py-tgcalls raises ``NoAudioSourceFound`` for BOTH cases
+    (see ffmpeg.py: an unreadable URL makes ffprobe print ``{}``, so the
+    stream list is empty and the audio check fails). Treating an unreadable
+    URL as "this itag has no audio" poisoned the picker's blacklist for 15
+    minutes and forced a full download for every later /play of that video.
+    """
+
+
+# ─── ROOT CAUSE: ffmpeg/ffprobe received only the LAST HTTP header ───────────
+#
+# py-tgcalls' build_command() emits one `-headers "K: V"` pair PER header:
+#
+#     ffprobe ... -headers 'User-Agent: ...' -headers 'Referer: ...' -i URL
+#
+# `-headers` is a single AVOption, so the second occurrence OVERWRITES the
+# first: the User-Agent never reaches the socket and ffmpeg sends its default
+# `Lavf/<version>`. googlevideo answers that with 403, ffprobe prints `{}`,
+# py-tgcalls sees zero streams and raises NoAudioSourceFound — the exact
+# Heroku line "Direct CDN stream unusable ... NoAudioSourceFound ... falling
+# back to download" followed by a 13-20s full download.
+#
+# Fix: collapse every `-headers` pair into ONE CRLF-joined value (verified
+# against a local HTTP server: both headers then arrive intact) and make sure
+# a googlevideo URL always carries a User-Agent matching the client that
+# minted it.
+_CLIENT_USER_AGENTS = {
+    "ANDROID": "com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip",
+    "ANDROID_MUSIC": (
+        "com.google.android.apps.youtube.music/6.42.52 "
+        "(Linux; U; Android 14) gzip"
+    ),
+    "ANDROID_VR": "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12)",
+    "IOS": (
+        "com.google.ios.youtube/19.09.3 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)"
+    ),
+    "IOS_MUSIC": (
+        "com.google.ios.youtubemusic/6.42.52 "
+        "(iPhone16,2; U; CPU iOS 17_4 like Mac OS X)"
+    ),
+    "TVHTML5": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+    "TVHTML5_SIMPLY_EMBEDDED_PLAYER": "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
+    "VISIONOS": (
+        "com.google.ios.youtube/19.09.3 (RealityDevice14,1; U; CPU visionOS 1_1)"
+    ),
+    "MWEB": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+    ),
+}
+_DEFAULT_WEB_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def client_user_agent(url: str) -> str:
+    """User-Agent matching the InnerTube client a googlevideo URL was signed for.
+
+    googlevideo ties a signed URL to the client in its ``c=`` query parameter;
+    a mismatched UA is answered with 403 even though the link is perfectly
+    valid.
+    """
+    text = str(url or "")
+    _, _, query = text.partition("?")
+    for part in query.split("&"):
+        name, _, value = part.partition("=")
+        if name == "c" and value:
+            return _CLIENT_USER_AGENTS.get(value.upper(), _DEFAULT_WEB_UA)
+    return _DEFAULT_WEB_UA
+
+
+def _is_googlevideo(url: str) -> bool:
+    return "googlevideo.com" in str(url or "")
+
+
+def merge_header_options(command: list) -> list:
+    """Collapse repeated ``-headers`` options into one CRLF-joined value."""
+    if not command:
+        return list(command or [])
+
+    collected: "dict[str, str]" = {}
+    merged: list = []
+    header_slot = -1
+    index = 0
+    while index < len(command):
+        value = command[index]
+        if value == "-headers" and index + 1 < len(command):
+            for line in str(command[index + 1]).split("\r\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                name, sep, header_value = line.partition(":")
+                if sep and name.strip():
+                    collected[name.strip()] = header_value.strip()
+            if header_slot < 0:
+                header_slot = len(merged)
+            index += 2
+            continue
+        merged.append(value)
+        index += 1
+
+    url = ""
+    if "-i" in merged:
+        position = merged.index("-i")
+        if position + 1 < len(merged):
+            url = str(merged[position + 1])
+
+    if _is_googlevideo(url) and not any(
+        key.lower() == "user-agent" for key in collected
+    ):
+        collected["User-Agent"] = client_user_agent(url)
+
+    if not collected:
+        return merged
+
+    if header_slot < 0:
+        header_slot = merged.index("-i") if "-i" in merged else len(merged)
+    blob = "".join(f"{name}: {value}\r\n" for name, value in collected.items())
+    merged[header_slot:header_slot] = ["-headers", blob]
+    return merged
+
+
+def _patch_build_command(_ffmpeg_mod, _media_stream_mod) -> None:
+    original = getattr(_ffmpeg_mod, "build_command", None)
+    if original is None or getattr(original, "_melody_patched", False):
+        return
+
+    def build_command(*args, **kwargs):
+        return merge_header_options(original(*args, **kwargs))
+
+    build_command._melody_patched = True  # type: ignore[attr-defined]
+    _ffmpeg_mod.build_command = build_command
+    if hasattr(_media_stream_mod, "build_command"):
+        _media_stream_mod.build_command = build_command
+    log.info("🔧 ffmpeg/ffprobe HTTP headers merged (User-Agent reaches the CDN).")
+
+
+async def probe_audio_streams(url: str, headers: "dict | None" = None) -> "bool | None":
+    """True/False when ffprobe could READ the url, None when it could not.
+
+    Used to tell a genuinely audio-less stream apart from a URL the CDN simply
+    refused, so only the former is ever blacklisted.
+    """
+    import asyncio
+    import json
+
+    if not _ffprobe_available():
+        return None
+    merged = dict(headers or {})
+    if _is_googlevideo(url) and not any(k.lower() == "user-agent" for k in merged):
+        merged["User-Agent"] = client_user_agent(url)
+    command = ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+               "-of", "json"]
+    if merged:
+        command += [
+            "-headers",
+            "".join(f"{name}: {value}\r\n" for name, value in merged.items()),
+        ]
+    command += ["-i", url]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(), timeout=PROBE_TIMEOUT_REMOTE
+        )
+    except Exception:  # noqa: BLE001 - probe is advisory only
+        return None
+    try:
+        streams = (json.loads(stdout.decode("utf-8") or "{}") or {}).get("streams") or []
+    except Exception:  # noqa: BLE001
+        return None
+    if not streams:
+        # Unreadable source (403/expired/blocked): NOT evidence of "no audio".
+        return None
+    return any(s.get("codec_type") == "audio" for s in streams)
+
+
+
+
 def _is_local_file(path) -> bool:
     try:
         return isinstance(path, str) and os.path.isfile(path)
@@ -319,7 +505,7 @@ _IS_CLOUD = bool(
     or os.getenv("FLY_APP_NAME")
 )
 try:
-    _cloud_budget = max(0.25, float(os.getenv("REMOTE_CHECK_CLOUD_BUDGET", "0.9")))
+    _cloud_budget = max(0.25, float(os.getenv("REMOTE_CHECK_CLOUD_BUDGET", "1.5")))
 except (TypeError, ValueError):
     _cloud_budget = 0.9
 _REMOTE_CHECK_BUDGET = min(
@@ -556,7 +742,26 @@ def apply_pytgcalls_probe_patch() -> None:
                 if name == "NoVideoSourceFound" and local:
                     # Audio-only file played as audio: expected, not an error.
                     return None
+                if name == "NoAudioSourceFound" and not local:
+                    # ROOT-CAUSE FIX: py-tgcalls raises this both for a real video-only
+                    # stream AND for a URL the CDN refused (ffprobe prints "{}",
+                    # so its stream list is empty). Re-probe ourselves with the
+                    # correct client User-Agent before believing it.
+                    verdict = await probe_audio_streams(path, stream_headers)
+                    if verdict is True:
+                        log.info(
+                            "⚡ CDN source carries audio (header-corrected probe) "
+                            "— playing directly."
+                        )
+                        return None
+                    if verdict is False:
+                        raise NoAudioTrack(
+                            f"source has no audio track ({_short_source(path)})"
+                        ) from exc
+                    # verdict is None: unreadable, fall through to the retry /
+                    # StreamProbeUnavailable path — never blacklist this URL.
                 last_exc = exc
+
                 if _is_missing_binary(exc):
                     # ffprobe vanished mid-run (or was never really there):
                     # remember it and stop probing for good.
@@ -616,6 +821,7 @@ def apply_pytgcalls_probe_patch() -> None:
         _media_stream_mod.check_stream = check_stream
 
     _patch_cleanup_commands(_ffmpeg_mod, _media_stream_mod)
+    _patch_build_command(_ffmpeg_mod, _media_stream_mod)
     _patch_terminate(_ffmpeg_mod)
     _applied = True
     log.info(

@@ -208,7 +208,11 @@ def _http_client_kwargs() -> dict:
         "http2": _http2_available(),
         "timeout": _httpx.Timeout(12.0, connect=5.0),
         "limits": _httpx.Limits(max_connections=20, max_keepalive_connections=10),
-        "headers": {"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"},
+        "headers": {"User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )},
         "follow_redirects": True,
         # See _NoStoreCookies: cross-client cookie bleed is what turned every
         # InnerTube probe into LOGIN_REQUIRED.
@@ -2035,7 +2039,11 @@ def _invidious_search_sync(query: str) -> dict | None:
         try:
             url = f"{inst}/api/v1/search?q={encoded}&type=video"
             client = get_http_sync_client()
-            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"}, timeout=5.0)
+            resp = client.get(url, headers={"User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )}, timeout=5.0)
             if resp.status_code != 200:
                 continue
             items = json.loads(resp.text)
@@ -4995,6 +5003,34 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
     return None
 
 
+def _stream_headers(raw: "dict | None", *urls: str) -> dict:
+    """Headers ffmpeg must send for a signed CDN URL.
+
+    ROOT-CAUSE FIX: googlevideo binds a signed URL to the InnerTube client in
+    its ``c=`` parameter and answers a mismatched (or missing) User-Agent with
+    403. ffprobe then prints nothing, py-tgcalls reports "no audio source" and
+    the whole /play fell back to a full download. Always ship a User-Agent that
+    matches the URL.
+    """
+    headers = {
+        k: v
+        for k, v in (raw or {}).items()
+        if k in ("User-Agent", "Referer") and v
+    }
+    if not headers.get("User-Agent"):
+        target = next((u for u in urls if u), "")
+        try:
+            from utils.pytgcalls_patch import client_user_agent
+
+            headers["User-Agent"] = client_user_agent(target)
+        except Exception:  # noqa: BLE001 - never break resolution
+            headers["User-Agent"] = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+    return headers
+
+
 def _resolve_stream_urls_innertube(video_id: str, want_video: bool) -> dict:
     """InnerTube-only resolve; raises when nothing usable comes back."""
     info = _innertube_streams_sync(video_id, want_video=want_video)
@@ -5003,16 +5039,11 @@ def _resolve_stream_urls_innertube(video_id: str, want_video: bool) -> dict:
         _note_innertube_stream(False)
         raise ValueError("innertube: no directly streamable format")
     picked["is_live"] = bool((info or {}).get("is_live"))
-    picked["headers"] = {
-        k: v
-        for k, v in ((info or {}).get("headers") or {}).items()
-        if k in ("User-Agent", "Referer")
-    } or {
-        k: v
-        for k, v in (_ydl_opts().get("http_headers") or {}).items()
-        if k in ("User-Agent", "Referer")
-    }
     urls = [u for u in (picked.get("video"), picked.get("audio")) if u]
+    picked["headers"] = _stream_headers(
+        ((info or {}).get("headers") or {}) or (_ydl_opts().get("http_headers") or {}),
+        *urls,
+    )
     picked["expires_at"] = min(_url_expiry(u) for u in urls) - _STREAM_URL_SAFETY_MARGIN
     _note_innertube_stream(True)
     return picked
@@ -5685,7 +5716,11 @@ def _invidious_streams_sync(video_id: str, want_video: bool) -> dict | None:
         try:
             response = get_http_sync_client().get(
                 f"{instance}/api/v1/videos/{video_id}",
-                headers={"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"},
+                headers={"User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )},
                 timeout=0.75,
             )
             if response.status_code != 200:
@@ -5719,7 +5754,9 @@ def _invidious_streams_sync(video_id: str, want_video: bool) -> dict | None:
             if not picked:
                 continue
             urls = [u for u in (picked.get("video"), picked.get("audio")) if u]
-            picked["headers"] = {"User-Agent": "Mozilla/5.0 (compatible; MelodyBot/1.0)"}
+            # A bot User-Agent is 403'd by googlevideo; use the UA matching
+            # the client the URL was signed for.
+            picked["headers"] = _stream_headers(None, *urls)
             picked["expires_at"] = min(_url_expiry(u) for u in urls) - _STREAM_URL_SAFETY_MARGIN
             LOGGER.info("#stream Invidious direct fallback resolved %s via %s", video_id, instance)
             return picked
@@ -5793,11 +5830,9 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
             if fmt_info.get("url") in urls and fmt_info.get("http_headers"):
                 resolved_headers.update(fmt_info["http_headers"])
                 break
-    picked["headers"] = {
-        k: v
-        for k, v in (resolved_headers or _ydl_opts().get("http_headers") or {}).items()
-        if k in ("User-Agent", "Referer")
-    }
+    picked["headers"] = _stream_headers(
+        resolved_headers or _ydl_opts().get("http_headers") or {}, *urls,
+    )
     picked["expires_at"] = min(_url_expiry(u) for u in urls) - _STREAM_URL_SAFETY_MARGIN
     return picked
 
