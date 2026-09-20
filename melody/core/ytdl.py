@@ -4765,7 +4765,19 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
     _MOBILE_ORDER = ("IOS", "ANDROID", "ANDROID_MUSIC", "IOS_MUSIC", "VISIONOS")
     _by_name = {c[0]: c for c in _CLIENTS}
 
-    session = {"visitor": "", "pot": ""}
+    # ROOT-CAUSE FIX (Sep 20 2026 production log — EVERY client answered
+    # `LOGIN_REQUIRED (Sign in to confirm you're not a bot)` / `Please sign
+    # in`, so InnerTube never returned a format, every /play fell through to
+    # a full yt-dlp download, and with no audio-only format on offer yt-dlp
+    # picked itag 18 — a 15-50 MB muxed *video* file for an audio track):
+    # YouTube now requires a session-bound PO token + visitorData on the
+    # MOBILE clients too, not just the web family. The session was only
+    # fetched when cookies existed and was only attached inside _probe() for
+    # web-family clients, so IOS/ANDROID/*_MUSIC/VISIONOS were always sent
+    # bare and were always rejected. Fetch the session unconditionally (it is
+    # cached process-wide, so this costs one request per _IT_SESSION_TTL) and
+    # attach it to every client below.
+    session = _innertube_session()
     if cookie_header:
         # SPEED FIX (Sep 20 production logs — "gana 4-5 sec ke andar nahi baj
         # raha"): with YT_COOKIES configured the code probed ONLY the WEB client.
@@ -4779,7 +4791,6 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         # session that may still work for some videos) alongside the mobile
         # clients so the fastest usable response wins instead of waiting for
         # WEB to fail and then paying the yt-dlp tax.
-        session = _innertube_session()
         mobile = [_by_name[n] for n in _MOBILE_ORDER
                   if n in _by_name and not _innertube_client_muted(n)]
         if not _innertube_client_muted("WEB"):
@@ -4802,7 +4813,11 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         if client_name.startswith("TVHTML5") or client_name == "WEB_EMBEDDED_PLAYER":
             body["context"]["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
         is_web = client_name in _WEB_FAMILY
-        if is_web and session.get("visitor"):
+        # visitorData + PO token go to EVERY client (see root-cause note
+        # above): without them the mobile clients answer LOGIN_REQUIRED from
+        # a datacenter IP, and the streaming URLs they do hand out are
+        # rejected with 403 unless bound to the same session.
+        if session.get("visitor"):
             ctx["visitorData"] = session["visitor"]
             if session.get("pot"):
                 body["serviceIntegrityDimensions"] = {"poToken": session["pot"]}
@@ -4811,8 +4826,9 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
                    "X-Youtube-Client-Name": _CLIENT_IDS.get(client_name, "1"),
                    "X-Youtube-Client-Version": client_ver,
                    "Origin": "https://www.youtube.com"}
-        if is_web and session.get("visitor"):
+        if session.get("visitor"):
             headers["X-Goog-Visitor-Id"] = session["visitor"]
+        if is_web and session.get("visitor"):
             headers["X-Origin"] = "https://www.youtube.com"
             auth = _sapisid_hash()
             if auth:
@@ -4853,7 +4869,7 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
                         str((data.get("playabilityStatus") or {}).get("reason") or "")[:60])
             # Per-client mute: only mute THIS client, not all of them
             _note_innertube_client(client_name, False)
-            if status == "LOGIN_REQUIRED" and is_web:
+            if status == "LOGIN_REQUIRED":
                 # Refresh visitorData + PO token in the background so the next
                 # track gets a working session instead of muting the fast path.
                 _it_session.pop("at", None)
