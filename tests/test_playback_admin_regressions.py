@@ -108,11 +108,38 @@ def test_cdn_probe_prefers_curl_cffi_with_urllib_fallback():
 
 
 def test_youtube_client_policy_keeps_cloud_direct_fallback_order():
+    """Cookies must never be replayed to the mobile app clients.
+
+    Sep 20 2026 05:13 production log: every client answered "Sign in to
+    confirm you're not a bot", the only surviving format was the muxed
+    itag 18, so the direct CDN URL had no clean audio track
+    (NoAudioSourceFound) and /play paid an 18 MB download (stream=16.68s).
+    With a cookiefile attached, ask the cookie-compatible web/TV clients;
+    the mobile clients stay reachable through the ladder rungs that drop
+    the cookiefile first.
+    """
     source = _source("melody/core/ytdl.py")
-    assert '"player_client": ["web_safari", "default", "ios"]' in source
+    assert '["web_safari", "web", "tv"] if has_cookies' in source
+    assert 'else ["ios", "visionos", "web"]' in source
     assert '"player_client": ["android_music", "android_vr", "tv", "ios", "web_safari"]' not in source
     assert '"client": client_name' in source
     assert '"User-Agent": ua' in source
+
+
+def test_innertube_mobile_probes_stay_session_free():
+    """Web-minted visitorData / PO token / cookies are web-family only.
+
+    Attaching the WEB `visitorData` to the IOS / ANDROID / *_MUSIC /
+    VISIONOS player probes made YouTube answer LOGIN_REQUIRED on every
+    single one of them (Sep 20 2026 05:13 log), which killed the direct
+    stream path entirely. Bare mobile probes answer OK with unciphered
+    CDN URLs, so no session material may leak into them.
+    """
+    source = _source("melody/core/ytdl.py")
+    assert 'if is_web and session.get("visitor"):\n            ctx["visitorData"]' in source
+    assert 'if session.get("visitor"):\n            ctx["visitorData"]' not in source
+    assert 'if session.get("visitor"):\n            headers["X-Goog-Visitor-Id"]' not in source
+    assert 'if cookie_header and client_name in _WEB_FAMILY:' in source
 
 
 def test_ytdlp_direct_resolver_preserves_format_headers():
