@@ -4813,13 +4813,20 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
         if client_name.startswith("TVHTML5") or client_name == "WEB_EMBEDDED_PLAYER":
             body["context"]["thirdParty"] = {"embedUrl": "https://www.youtube.com/"}
         is_web = client_name in _WEB_FAMILY
-        # visitorData + PO token go to EVERY client (see root-cause note
-        # above): without them the mobile clients answer LOGIN_REQUIRED from
-        # a datacenter IP, and the streaming URLs they do hand out are
-        # rejected with 403 unless bound to the same session.
+        # ROOT-CAUSE FIX #2 (Sep 20 2026, live probe from a datacenter IP):
+        # attaching the *web-bound* PO token to the mobile clients is what
+        # made IOS / ANDROID / *_MUSIC / VISIONOS answer LOGIN_REQUIRED on
+        # every single track. A PO token is bound to the session AND the
+        # client that minted it; a web token presented by the iOS app is a
+        # mismatch, and YouTube answers "Sign in to confirm you're not a
+        # bot". Verified: bare IOS/ANDROID -> OK with 21-23 unciphered URLs,
+        # IOS + visitorData -> still OK, IOS + web PO token -> LOGIN_REQUIRED.
+        # So: visitorData goes to every client (harmless and keeps the
+        # streaming URLs session-consistent), the PO token goes to the web
+        # family only.
         if session.get("visitor"):
             ctx["visitorData"] = session["visitor"]
-            if session.get("pot"):
+            if is_web and session.get("pot"):
                 body["serviceIntegrityDimensions"] = {"poToken": session["pot"]}
         payload = json.dumps(body).encode("utf-8")
         headers = {"Content-Type": "application/json", "User-Agent": ua,
@@ -4869,9 +4876,12 @@ def _innertube_streams_sync(video_id: str, want_video: bool = False) -> "dict | 
                         str((data.get("playabilityStatus") or {}).get("reason") or "")[:60])
             # Per-client mute: only mute THIS client, not all of them
             _note_innertube_client(client_name, False)
-            if status == "LOGIN_REQUIRED":
+            if status == "LOGIN_REQUIRED" and is_web:
                 # Refresh visitorData + PO token in the background so the next
                 # track gets a working session instead of muting the fast path.
+                # Mobile clients never carry a PO token (see above), so a
+                # mobile LOGIN_REQUIRED says nothing about the session — busting
+                # the cache there just burns an extra request per track.
                 _it_session.pop("at", None)
             return None
 
