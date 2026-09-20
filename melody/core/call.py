@@ -1001,7 +1001,7 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
     headers = urls.get("headers") or None
 
     if video:
-        return MediaStream(
+        built = MediaStream(
             video_url,
             audio_parameters=_get_audio_quality(),
             video_parameters=_get_video_quality(),
@@ -1013,8 +1013,15 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
             headers=headers,
             ffmpeg_parameters=ffmpeg_params,
         )
+        # Remembered so a probe failure can blacklist exactly this CDN URL
+        # instead of re-resolving straight back into it.
+        try:
+            built._melody_audio_url = audio_url
+        except Exception:  # noqa: BLE001 - best effort only
+            pass
+        return built
 
-    return MediaStream(
+    built = MediaStream(
         audio_url,
         audio_parameters=_get_audio_quality(),
         # Explicit audio_path: without it PyTgCalls only derives the microphone
@@ -1027,6 +1034,11 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
         headers=headers,
         ffmpeg_parameters=ffmpeg_params,
     )
+    try:
+        built._melody_audio_url = audio_url
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+    return built
 
 
 def get_speed(chat_id: int) -> float:
@@ -1911,6 +1923,19 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 # bounded chance before waiting for the slower local download.
                 # This keeps the normal path under the 5-10s target while still
                 # ensuring one transient CDN failure cannot kill playback.
+                # ROOT-CAUSE FIX ("NoAudioSourceFound" → 13-20s download):
+                # ffprobe just proved this signed CDN URL carries no audio
+                # track. Blacklist it before re-resolving, otherwise the
+                # forced retry picks the identical itag, fails again, and the
+                # whole probe budget is wasted before the fallback starts.
+                if "no audio source" in str(play_exc).lower():
+                    try:
+                        from melody.core.ytdl import note_no_audio_url
+
+                        note_no_audio_url(getattr(stream, "_melody_audio_url", "") or "")
+                    except Exception:  # noqa: BLE001 - never break playback
+                        pass
+
                 direct_retry_ok = False
                 if (
                     filepath is None

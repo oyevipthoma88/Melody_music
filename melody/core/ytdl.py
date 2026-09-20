@@ -5327,6 +5327,83 @@ def _max_stream_height() -> int:
     }.get((_os.getenv("VIDEO_QUALITY") or "480p").strip().lower(), 480)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  "No audio source found" memory
+#
+#  ROOT-CAUSE FIX (Heroku log: "Direct CDN stream unusable ...
+#  NoAudioSourceFound: No audio source found on https://...googlevideo.com/
+#  videoplayback"): ffprobe tells us, authoritatively, that a signed CDN URL
+#  carries no audio track. That is a property of the URL, not a transient CDN
+#  hiccup, so re-resolving with force=True used to hand the very same URL back
+#  and burn another probe budget before the slow full-download fallback.
+#  Remember such URLs for a while and never pick them again for an audio
+#  request.
+# ─────────────────────────────────────────────────────────────────────────────
+_NO_AUDIO_URLS: dict[str, float] = {}
+_NO_AUDIO_TTL = 900.0
+
+
+def _url_fingerprint(url: str) -> str:
+    """Signed googlevideo URLs differ per resolve; the path+itag does not."""
+    if not url:
+        return ""
+    base, _, query = str(url).partition("?")
+    itag = ""
+    for part in query.split("&"):
+        if part.startswith("itag="):
+            itag = part
+            break
+    return f"{base}|{itag}"
+
+
+def note_no_audio_url(url: str) -> None:
+    """Record that ffprobe found no audio track on `url`."""
+    key = _url_fingerprint(url)
+    if not key:
+        return
+    now = _time_mod.monotonic()
+    for stale in [k for k, exp in _NO_AUDIO_URLS.items() if exp <= now]:
+        _NO_AUDIO_URLS.pop(stale, None)
+    _NO_AUDIO_URLS[key] = now + _NO_AUDIO_TTL
+    # A cached resolve pointing at the same dead URL must not be replayed.
+    for cache_key, entry in list(_stream_url_cache.items()):
+        if _url_fingerprint((entry or {}).get("audio") or "") == key:
+            _stream_url_cache.pop(cache_key, None)
+
+
+def _maybe_has_audio(fmt: dict) -> bool:
+    """True unless the format is (almost certainly) a video-only stream.
+
+    ffprobe raising ``NoAudioSourceFound`` on a picked "audio" URL always
+    traced back to an adaptive video-only itag slipping through the
+    metadata-light last resort, so the test is deliberately conservative:
+    an explicit ``acodec="none"`` (or ``audio_ext="none"``) is rejected, a
+    declared acodec is accepted, and a format with a video track but no audio
+    evidence whatsoever is treated as video-only.
+    """
+    acodec = fmt.get("acodec")
+    if acodec == "none":
+        return False
+    if acodec not in (None, "none"):
+        return True
+    if str(fmt.get("audio_ext") or "").lower() == "none":
+        return False
+    if fmt.get("vcodec") not in (None, "none") and not (fmt.get("abr") or 0):
+        return False
+    return True
+
+
+def _url_has_no_audio(url: str) -> bool:
+    key = _url_fingerprint(url)
+    if not key:
+        return False
+    expires = _NO_AUDIO_URLS.get(key, 0.0)
+    if expires <= _time_mod.monotonic():
+        _NO_AUDIO_URLS.pop(key, None)
+        return False
+    return True
+
+
 def _pick_stream_formats(info: dict, want_video: bool) -> dict:
     """Choose the best (video_url, audio_url) pair out of a yt-dlp info dict.
 
@@ -5340,7 +5417,10 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
     re-parse the manifest mid-playback and its segment timestamps do not start
     at zero, which is the other classic source of A/V drift.
     """
-    all_formats = [f for f in (info.get("formats") or []) if f.get("url")]
+    all_formats = [
+        f for f in (info.get("formats") or [])
+        if f.get("url") and not (not want_video and _url_has_no_audio(f["url"]))
+    ]
 
     def usable(f) -> bool:
         proto = (f.get("protocol") or "")
@@ -5460,7 +5540,20 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
                 cheapest = min(muxed_fmts, key=lambda f: (f.get("height") or 0,
                                                           f.get("tbr") or 0))
                 return {"audio": cheapest["url"], "video": None}
-            metadata_light = [f for f in formats if str(f.get("url") or "").startswith(("http://", "https://"))]
+            # ROOT-CAUSE FIX ("NoAudioSourceFound: No audio source found on
+            # https://...googlevideo.com/videoplayback"): this last-resort list
+            # used to accept ANY http(s) format — including adaptive
+            # VIDEO-ONLY itags, which are the cheapest by (height, tbr) and so
+            # were picked first. ffprobe then found no audio track at all, the
+            # forced retry re-picked the same itag, and every such /play paid a
+            # full 13-20s download fallback. Only formats that can actually
+            # carry audio (acodec present, or genuinely unknown metadata) are
+            # eligible now; an explicit acodec="none" is never audio.
+            metadata_light = [
+                f for f in formats
+                if str(f.get("url") or "").startswith(("http://", "https://"))
+                and _maybe_has_audio(f)
+            ]
             if metadata_light:
                 cheapest = min(metadata_light, key=lambda f: (f.get("height") or 0,
                                                               f.get("tbr") or f.get("abr") or 0))

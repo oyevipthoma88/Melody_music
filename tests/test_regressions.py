@@ -890,8 +890,24 @@ def test_play_has_single_direct_stream_owner_for_current_track():
 
 def test_direct_audio_accepts_metadata_light_http_formats():
     ytdl = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
-    assert "metadata_light = [f for f in formats" in ytdl
+    assert "metadata_light = [" in ytdl
     assert "accepted metadata-light direct audio URL" in ytdl
+    # The last resort must never hand a VIDEO-ONLY itag to the audio path:
+    # ffprobe then raises NoAudioSourceFound and the song pays a full
+    # download fallback (see _maybe_has_audio()).
+    assert "_maybe_has_audio(f)" in ytdl
+    assert "def _maybe_has_audio(" in ytdl
+
+
+def test_no_audio_cdn_url_is_blacklisted_instead_of_being_re_picked():
+    ytdl = (ROOT / "melody/core/ytdl.py").read_text(encoding="utf-8")
+    call = (ROOT / "melody/core/call.py").read_text(encoding="utf-8")
+    assert "def note_no_audio_url(" in ytdl
+    assert "_NO_AUDIO_URLS" in ytdl
+    assert "_url_has_no_audio(f[\"url\"])" in ytdl
+    assert "no audio source" in call
+    assert "note_no_audio_url" in call
+    assert "_melody_audio_url" in call
 
 
 def test_top_level_hls_url_is_preserved_for_direct_playback():
