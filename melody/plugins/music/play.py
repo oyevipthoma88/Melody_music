@@ -452,11 +452,28 @@ async def _play_core(client: Client, message: Message, video: bool = False, forc
         anim = await anim_task
 
         activity_label = "Force Played" if force else ("Now Playing" if playing_now else "Queued")
+        # REQUESTED: the log channel must show the same stage timings that go
+        # to the console (search / join / stream / TOTAL) plus the track and
+        # queue context, so slow plays can be diagnosed straight from Telegram.
+        try:
+            _queue_len = len(get_queue(chat.id))
+        except Exception:  # noqa: BLE001 - logging must never break playback
+            _queue_len = 0
+        _mode = "Video" if video else "Audio"
+        _dur = format_duration(info.get("duration") or 0)
         spawn(log_activity(
             f"🎵 <b>{activity_label}</b>\n"
             f"• Song: <code>{html.escape(info['title'][:60])}</code>\n"
+            f"• Duration: <code>{html.escape(_dur)}</code> · Mode: <code>{_mode}</code>\n"
+            f"• Video ID: <code>{html.escape(str(info.get('id') or '-'))}</code>\n"
             f"• Requested by: {html.escape(requester_name or 'Unknown')} (<code>{requester_id}</code>)\n"
-            f"• Chat: {html.escape(chat.title or 'Private')} (<code>{chat.id}</code>)"
+            f"• Chat: {html.escape(chat.title or 'Private')} (<code>{chat.id}</code>)\n"
+            f"• Queue: <code>{_queue_len}</code> · Outcome: <code>{_outcome}</code>\n"
+            f"⏱ <b>Timings</b>\n"
+            f"• Search: <code>{_t_info:.2f}s</code>\n"
+            f"• Join: <code>{max(0.0, _t_join - _t_info):.2f}s</code>\n"
+            f"• Stream: <code>{_stream_elapsed:.2f}s</code>\n"
+            f"• <b>Total: <code>{_total_elapsed:.2f}s</code></b>"
         ))
 
         status_label = "Force Played" if force else ("Now Playing" if playing_now else "Added to Queue")
