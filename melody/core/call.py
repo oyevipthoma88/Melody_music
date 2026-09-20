@@ -1036,9 +1036,41 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
     )
     try:
         built._melody_audio_url = audio_url
+        # Remaining playable audio URLs for this exact video. A probe failure
+        # can retry against a genuinely different stream in milliseconds
+        # instead of re-resolving (3-4s) or downloading the whole song.
+        built._melody_audio_candidates = [
+            u for u in (urls.get("candidates") or []) if u and u != audio_url
+        ]
+        built._melody_headers = headers
+        built._melody_ffmpeg_params = ffmpeg_params
     except Exception:  # noqa: BLE001 - best effort only
         pass
     return built
+
+
+def _swap_audio_source(stream, audio_url: str):
+    """Clone an audio-only direct MediaStream onto a different CDN URL."""
+    built = MediaStream(
+        audio_url,
+        audio_parameters=_get_audio_quality(),
+        audio_path=audio_url,
+        video_flags=MediaStream.Flags.IGNORE,
+        headers=getattr(stream, "_melody_headers", None),
+        ffmpeg_parameters=getattr(stream, "_melody_ffmpeg_params", None),
+    )
+    try:
+        built._melody_audio_url = audio_url
+        built._melody_audio_candidates = [
+            u for u in (getattr(stream, "_melody_audio_candidates", None) or [])
+            if u != audio_url
+        ]
+        built._melody_headers = getattr(stream, "_melody_headers", None)
+        built._melody_ffmpeg_params = getattr(stream, "_melody_ffmpeg_params", None)
+    except Exception:  # noqa: BLE001 - best effort only
+        pass
+    return built
+
 
 
 def get_speed(chat_id: int) -> float:
@@ -1937,8 +1969,56 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                         pass
 
                 direct_retry_ok = False
+
+                # ROOT-CAUSE FIX (Heroku: "#stream fresh direct retry failed
+                # ... StreamProbeUnavailable" 0.15s after a 3.45s re-resolve,
+                # then a 12.9s download): re-resolving returns YouTube's
+                # deterministic format ranking, i.e. the same dead stream from
+                # another CDN mirror. The other formats the resolver already
+                # listed were never tried. Try those FIRST — each attempt is a
+                # play() call with no network resolve in front of it.
                 if (
                     filepath is None
+                    and not early_file
+                    and not local_proxy_source
+                    and not video
+                    and _is_probe_error(play_exc)
+                ):
+                    for alt_url in list(
+                        getattr(stream, "_melody_audio_candidates", None) or []
+                    )[:2]:
+                        if startup_deadline - time.monotonic() <= 2.0:
+                            break
+                        try:
+                            alt_stream = _swap_audio_source(stream, alt_url)
+                            await asyncio.wait_for(
+                                _pytgcalls.play(chat_id, alt_stream),
+                                timeout=_PLAY_PROBE_TIMEOUT,
+                            )
+                            stream = alt_stream
+                            direct_retry_ok = True
+                            LOGGER.info(
+                                "#stream alternate direct source recovered %s in %s",
+                                track.video_id, chat_id,
+                            )
+                            break
+                        except Exception as alt_exc:  # noqa: BLE001
+                            if "no audio source" in str(alt_exc).lower():
+                                try:
+                                    from melody.core.ytdl import note_no_audio_url
+
+                                    note_no_audio_url(alt_url)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            LOGGER.info(
+                                "#stream alternate direct source failed for %s in %s (%s)",
+                                track.video_id, chat_id, type(alt_exc).__name__,
+                            )
+
+                if (
+                    not direct_retry_ok
+                    and filepath is None
+
                     and not early_file
                     and not local_proxy_source
                     and startup_deadline - time.monotonic() > 2.0

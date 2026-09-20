@@ -5344,16 +5344,29 @@ _NO_AUDIO_TTL = 900.0
 
 
 def _url_fingerprint(url: str) -> str:
-    """Signed googlevideo URLs differ per resolve; the path+itag does not."""
+    """Identify a CDN stream independently of which POP served it.
+
+    Heroku log evidence: the first resolve handed back
+    ``rr3---sn-p5qs7nzr.googlevideo.com/videoplayback?...itag=18`` and the
+    forced retry handed back ``rr1---sn-p5qs7n6y.googlevideo.com/...`` for the
+    SAME itag of the SAME video — a different mirror of the identical,
+    audio-less stream. A host-sensitive fingerprint therefore never matched and
+    the blacklist did nothing. Key on the content id + itag instead (that pair
+    is stable across mirrors and re-signs) and only fall back to the path when
+    the URL is not a googlevideo one.
+    """
     if not url:
         return ""
     base, _, query = str(url).partition("?")
-    itag = ""
+    params = {}
     for part in query.split("&"):
-        if part.startswith("itag="):
-            itag = part
-            break
-    return f"{base}|{itag}"
+        name, _, value = part.partition("=")
+        if name in ("id", "itag") and value:
+            params[name] = value
+    if params.get("id"):
+        return f"gv:{params['id']}|{params.get('itag', '')}"
+    return f"{base}|itag={params.get('itag', '')}"
+
 
 
 def note_no_audio_url(url: str) -> None:
@@ -5404,7 +5417,7 @@ def _url_has_no_audio(url: str) -> bool:
     return True
 
 
-def _pick_stream_formats(info: dict, want_video: bool) -> dict:
+def _pick_stream_formats_primary(info: dict, want_video: bool) -> dict:
     """Choose the best (video_url, audio_url) pair out of a yt-dlp info dict.
 
     Progressive (muxed) formats are preferred for video when one is available
@@ -5597,6 +5610,66 @@ def _pick_stream_formats(info: dict, want_video: bool) -> dict:
         best_muxed = max(muxed_fmts, key=lambda f: (height(f), f.get("tbr") or 0))
         return {"video": best_muxed["url"], "audio": best_muxed["url"]}
     return {}
+
+
+def _audio_stream_candidates(info: dict, primary: str | None) -> list[str]:
+    """Ordered ALTERNATE audio URLs for the same video, best first.
+
+    ROOT-CAUSE FIX for the repeating Heroku line
+
+        Direct CDN stream unusable ... (NoAudioSourceFound: No audio source
+        found on "https://rrN---sn-....googlevideo.com/videoplayback")
+        — falling back to download.
+
+    One signed URL being unreadable never meant the video had no streamable
+    audio: yt-dlp/InnerTube list several playable formats, and only the single
+    picked one was ever tried. The recovery path then re-RESOLVED from scratch
+    (3-4s) and, because YouTube ranks formats deterministically, usually got
+    the very same dead stream back — so every such /play still paid the full
+    13-20s download. Handing the caller the remaining candidates lets it retry
+    in milliseconds against a genuinely different stream first.
+    """
+    seen: set[str] = set()
+    if primary:
+        seen.add(primary)
+    ranked: list[tuple[tuple[int, float], str]] = []
+    for fmt in (info.get("formats") or []):
+        url = fmt.get("url")
+        if not url or url in seen or not str(url).startswith(("http://", "https://")):
+            continue
+        if not _maybe_has_audio(fmt) or _url_has_no_audio(url):
+            continue
+        proto = str(fmt.get("protocol") or "")
+        if "m3u8" in proto:
+            continue
+        seen.add(url)
+        audio_only = fmt.get("vcodec") in (None, "none")
+        # Audio-only first (cheapest + no camera track), then the smallest
+        # muxed format; within a tier prefer the higher bitrate.
+        tier = 0 if audio_only else 1
+        ranked.append(((tier, -float(fmt.get("abr") or fmt.get("tbr") or 0)), url))
+    ranked.sort(key=lambda item: item[0])
+    candidates = [url for _, url in ranked]
+    manifest = info.get("hlsManifestUrl")
+    if manifest and manifest not in seen:
+        candidates.append(manifest)
+    return candidates[:_MAX_AUDIO_CANDIDATES]
+
+
+_MAX_AUDIO_CANDIDATES = 4
+
+
+def _pick_stream_formats(info: dict, want_video: bool) -> dict:
+    """`_pick_stream_formats_primary` plus ready-to-use fallback URLs.
+
+    The picked stream stays exactly the same; ``candidates`` simply carries the
+    other playable audio URLs so a probe failure costs one extra play() attempt
+    instead of a re-resolve or a complete download.
+    """
+    picked = _pick_stream_formats_primary(info, want_video) or {}
+    if picked and not want_video:
+        picked["candidates"] = _audio_stream_candidates(info, picked.get("audio"))
+    return picked
 
 
 def _invidious_streams_sync(video_id: str, want_video: bool) -> dict | None:

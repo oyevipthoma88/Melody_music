@@ -908,6 +908,11 @@ def test_no_audio_cdn_url_is_blacklisted_instead_of_being_re_picked():
     assert "no audio source" in call
     assert "note_no_audio_url" in call
     assert "_melody_audio_url" in call
+    # Mirror-proof blacklist + alternate-source retry before any re-resolve.
+    assert "gv:" in ytdl
+    assert "def _audio_stream_candidates(" in ytdl
+    assert "_melody_audio_candidates" in call
+    assert "alternate direct source recovered" in call
 
 
 def test_top_level_hls_url_is_preserved_for_direct_playback():
