@@ -1989,42 +1989,56 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                             track.video_id, audio_only=not video, priority=priority,
                             owner=chat_id, allow_early=not video,
                         )
-                if filepath and not filepath.endswith(".early"):
-                    spawn(_persist_completed_song(filepath, track), name=f"song-cache:{track.video_id}")
-                stream = _local_media_stream(chat_id, filepath, video, start_at)
-                if _is_stale_generation(chat_id, gen):
-                    LOGGER.info(
-                        "#stream discarding stale fallback resolve for %s in %s "
-                        "(gen=%s no longer authoritative)", track.video_id, chat_id, gen,
-                    )
-                    return
-                # The direct attempt may have burnt the cached peer (CHANNEL_INVALID
-                # in the log came from THIS second play, not the first): re-prime it.
-                forget_assistant_peer(chat_id)
-                await ensure_assistant_peer(chat_id)
-                try:
-                    await asyncio.wait_for(
-                        _pytgcalls.play(chat_id, stream),
-                        timeout=_LOCAL_PLAY_TIMEOUT,
-                    )
-                except ChatAdminRequired:
-                    # A direct probe can fail first and the fallback play can then
-                    # be the first call-creating RPC. Do not let that second
-                    # CHAT_ADMIN_REQUIRED escape into the generic crash logger.
-                    _block_vc_admin(chat_id)
-                    if download_task is not None and not download_task.done():
-                        download_task.cancel()
-                        download_task.add_done_callback(_consume_task_exception)
-                    if _vc_admin_notice_needed(chat_id):
-                        _mark_vc_admin_notified(chat_id)
-                        await _notify_playback_failed(
-                            chat_id, VC_ADMIN_REQUIRED_MESSAGE,
+                # ROOT-CAUSE FIX ("gana 4-5 sec ke andar nahi baj raha"):
+                # When the fresh direct retry above already succeeded,
+                # `direct_retry_ok` is True, `stream` already holds the working
+                # direct MediaStream, and _pytgcalls.play() was already called
+                # inside the retry block. The code below rebuilds a *local* stream
+                # from `filepath` — but on the direct path filepath is None
+                # (nothing was downloaded), so _local_media_stream() built a
+                # MediaStream with media_path=None and the second play() raised
+                #   "Argument 'media_path' has incorrect type ... got 'NoneType'"
+                # which is NOT a probe error, so it re-raised, bubbled to the
+                # outer handler, and forced the 13s full-download fallback the
+                # logs show. Skip the local rebuild + second play entirely when
+                # the direct retry already handed off a live stream.
+                if not direct_retry_ok:
+                    if filepath and not filepath.endswith(".early"):
+                        spawn(_persist_completed_song(filepath, track), name=f"song-cache:{track.video_id}")
+                    stream = _local_media_stream(chat_id, filepath, video, start_at)
+                    if _is_stale_generation(chat_id, gen):
+                        LOGGER.info(
+                            "#stream discarding stale fallback resolve for %s in %s "
+                            "(gen=%s no longer authoritative)", track.video_id, chat_id, gen,
                         )
-                    LOGGER.info(
-                        "fallback VC creation blocked in %s: assistant needs admin rights",
-                        chat_id,
-                    )
-                    return False
+                        return
+                    # The direct attempt may have burnt the cached peer (CHANNEL_INVALID
+                    # in the log came from THIS second play, not the first): re-prime it.
+                    forget_assistant_peer(chat_id)
+                    await ensure_assistant_peer(chat_id)
+                    try:
+                        await asyncio.wait_for(
+                            _pytgcalls.play(chat_id, stream),
+                            timeout=_LOCAL_PLAY_TIMEOUT,
+                        )
+                    except ChatAdminRequired:
+                        # A direct probe can fail first and the fallback play can then
+                        # be the first call-creating RPC. Do not let that second
+                        # CHAT_ADMIN_REQUIRED escape into the generic crash logger.
+                        _block_vc_admin(chat_id)
+                        if download_task is not None and not download_task.done():
+                            download_task.cancel()
+                            download_task.add_done_callback(_consume_task_exception)
+                        if _vc_admin_notice_needed(chat_id):
+                            _mark_vc_admin_notified(chat_id)
+                            await _notify_playback_failed(
+                                chat_id, VC_ADMIN_REQUIRED_MESSAGE,
+                            )
+                        LOGGER.info(
+                            "fallback VC creation blocked in %s: assistant needs admin rights",
+                            chat_id,
+                        )
+                        return False
 
             # A newer request can arrive while the Telegram RPC above is in
             # flight. The external call cannot be rolled back, but its stale
