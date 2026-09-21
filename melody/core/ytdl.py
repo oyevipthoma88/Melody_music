@@ -5947,6 +5947,21 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
     return picked
 
 
+def peek_stream_urls(video_id: str, want_video: bool = False) -> dict | None:
+    """Return a still-valid cached direct-URL set, or None. Never blocks.
+
+    Used by playback to pick up a resolve that finished AFTER its own race
+    budget (logged as "late direct resolve cached"). Previously that work was
+    only useful for the next play; the song already waiting kept downloading
+    the whole file.
+    """
+    key = f"{video_id}:{'v' if want_video else 'a'}"
+    cached = _stream_url_cache.get(key)
+    if cached and cached.get("expires_at", 0) > _time_mod.time() and cached.get("audio"):
+        return cached
+    return None
+
+
 def _cache_late_resolve(key: str):
     """Cache a direct-resolve result that arrived after the race budget."""
 
@@ -6083,7 +6098,22 @@ async def resolve_stream_urls(
         # Absolute budget measured from the very start of the resolve (the
         # InnerTube head start counts against it), with a small floor so the
         # yt-dlp fallback always gets a fair chance to answer.
-        deadline = max(_t0 + _RESOLVE_TIMEOUT, _time_mod.monotonic() + 1.5)
+        # SPEED FIX (Heroku log: "innertube globally blocked … direct resolve
+        # gave up after 9.84s" then "late direct resolve cached" seconds
+        # later): when InnerTube is muted, yt-dlp is the ONLY resolver, and
+        # cutting it off at the shared 9s budget threw away a URL that was
+        # nearly ready — forcing a full 86 MB download instead. Give the solo
+        # resolver a wider deadline; playback is no longer blocked on it
+        # because the download races in parallel and hands off whichever
+        # source is ready first.
+        _solo_resolver = it_task is None
+        _budget = _RESOLVE_TIMEOUT
+        if _solo_resolver:
+            _budget = max(
+                _RESOLVE_TIMEOUT,
+                min(45.0, _env_float("DIRECT_RESOLVE_SOLO_MAX", 25.0)),
+            )
+        deadline = max(_t0 + _budget, _time_mod.monotonic() + 1.5)
         try:
             while pending:
                 remaining = deadline - _time_mod.monotonic()

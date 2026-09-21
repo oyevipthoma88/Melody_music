@@ -114,11 +114,15 @@ try:
     # time, the direct URL was thrown away and playback waited on the download
     # instead. The race still exits the INSTANT any source is ready, so a
     # larger ceiling costs nothing on the happy path and saves the slow one.
+    # ⚡ 5-SECOND RULE (owner request): the race must not hold the song past
+    # ~5s. Nothing is thrown away when it expires any more — the download and
+    # the direct resolve keep running and hand off the moment they are ready
+    # (see _await_late_sources below), so a short budget is now free.
     _PLAY_START_BUDGET = max(
-        2.0, min(12.0, float(os.getenv("PLAY_START_BUDGET", "8.0")))
+        2.0, min(12.0, float(os.getenv("PLAY_START_BUDGET", "5.0")))
     )
 except Exception:  # noqa: BLE001
-    _PLAY_START_BUDGET = 8.0
+    _PLAY_START_BUDGET = 5.0
 try:
     # The source race is intentionally short, but a fallback download that has
     # already started must not be cancelled at that boundary. Give it its own
@@ -1751,13 +1755,117 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     timeout=_PLAY_FALLBACK_TIMEOUT,
                 )
             except asyncio.TimeoutError:
-                LOGGER.warning(
-                    "fallback source exceeded grace window for %s in %s",
+                # NOT a failure: the download is still running. Returning None
+                # lets _await_late_sources() keep waiting for it (and for a
+                # late direct URL) instead of crashing the play.
+                LOGGER.info(
+                    "fallback source still downloading for %s in %s — deferring handoff",
                     track.video_id, chat_id,
                 )
-                raise asyncio.TimeoutError(
-                    "fallback download exceeded startup budget; startup grace window expired"
-                )
+                return None
+
+        def _deferred_wait_seconds() -> float:
+            """Grace window scaled to the media length.
+
+            CRASH FIX ("_stream_track failed … playback source startup budget
+            exceeded" on a full movie): a flat 30s window is far too small for
+            an hour-long source on a 1-CPU dyno, so a perfectly healthy
+            download was being reported to the owner as a crash.
+            """
+            try:
+                duration = int(getattr(track, "duration", 0) or 0)
+            except Exception:  # noqa: BLE001
+                duration = 0
+            extra = min(300.0, (duration / 60.0) * 4.0)
+            return _PLAY_FALLBACK_TIMEOUT + extra
+
+        async def _await_late_sources():
+            """Keep waiting after the 5s race instead of failing the play.
+
+            The race budget only decides how long the *user* waits for the
+            fastest source. Whatever is still running (direct CDN resolve or
+            the fallback download) is allowed to finish here and is handed to
+            playback the instant it lands. A late direct URL that the resolver
+            cached after its own budget expired is also picked up, so a slow
+            extraction no longer forces the whole file to download.
+            """
+            nonlocal filepath, early_file
+            if early_task is not None and not early_task.done():
+                early_task.cancel()
+            deadline = time.monotonic() + _deferred_wait_seconds()
+            try:
+                from melody.core.ytdl import peek_stream_urls
+            except Exception:  # noqa: BLE001
+                peek_stream_urls = None  # type: ignore[assignment]
+            while time.monotonic() < deadline:
+                alive = {
+                    t for t in (direct_task, download_task)
+                    if t is not None and not t.done()
+                }
+                if alive:
+                    await asyncio.wait(
+                        alive, return_when=asyncio.FIRST_COMPLETED, timeout=1.0,
+                    )
+                else:
+                    await asyncio.sleep(0.2)
+
+                if direct_task is not None and direct_task.done():
+                    try:
+                        direct_result = direct_task.result()
+                    except Exception as exc:  # noqa: BLE001
+                        source_errors.append(exc)
+                        direct_result = None
+                    if direct_result is not None:
+                        LOGGER.info(
+                            "⚡ #stream late direct source handed off for %s",
+                            track.video_id,
+                        )
+                        return direct_result
+
+                if download_task is not None and download_task.done():
+                    try:
+                        late_path = download_task.result()
+                    except Exception as exc:  # noqa: BLE001
+                        source_errors.append(exc)
+                        late_path = None
+                    if late_path:
+                        filepath = late_path
+                        early_file = bool(filepath.endswith(".early"))
+                        spawn(
+                            _archive_download_task(download_task),
+                            name=f"archive:{track.video_id}",
+                        )
+                        return _local_media_stream(chat_id, filepath, video, start_at)
+
+                # A resolve that finished *after* its own budget caches the URL.
+                if peek_stream_urls is not None and not video:
+                    try:
+                        cached_urls = peek_stream_urls(track.video_id, want_video=False)
+                    except Exception:  # noqa: BLE001
+                        cached_urls = None
+                    if cached_urls and cached_urls.get("audio"):
+                        late_direct = await _build_direct_stream(
+                            chat_id, track, video, start_at,
+                        )
+                        if late_direct is not None:
+                            LOGGER.info(
+                                "⚡ #stream late cached direct URL used for %s",
+                                track.video_id,
+                            )
+                            return late_direct
+
+                on_disk = cached_file_path(track.video_id, audio_only=not video)
+                if on_disk:
+                    filepath = on_disk
+                    early_file = False
+                    return _local_media_stream(chat_id, filepath, video, start_at)
+
+                if (
+                    (direct_task is None or direct_task.done())
+                    and (download_task is None or download_task.done())
+                ):
+                    break
+            return None
 
         while pending and stream is None:
             remaining = startup_deadline - time.monotonic()
@@ -1769,8 +1877,12 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     stream = _local_media_stream(chat_id, filepath, video, start_at)
                     spawn(_archive_download_task(download_task), name=f"archive:{track.video_id}")
                     break
+                late_stream = await _await_late_sources()
+                if late_stream is not None:
+                    stream = late_stream
+                    break
                 for task in pending:
-                    if task is not download_task:
+                    if task is not download_task and task is not direct_task:
                         task.cancel()
                 raise asyncio.TimeoutError("playback source startup budget exceeded")
             done, pending = await asyncio.wait(
@@ -1784,8 +1896,12 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                     stream = _local_media_stream(chat_id, filepath, video, start_at)
                     spawn(_archive_download_task(download_task), name=f"archive:{track.video_id}")
                     break
+                late_stream = await _await_late_sources()
+                if late_stream is not None:
+                    stream = late_stream
+                    break
                 for task in pending:
-                    if task is not download_task:
+                    if task is not download_task and task is not direct_task:
                         task.cancel()
                 raise asyncio.TimeoutError("playback source startup budget exceeded")
             for task in done:
