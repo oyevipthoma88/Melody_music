@@ -165,6 +165,17 @@ def _keep_background_tasks_alive() -> None:
                     return
             except Exception:
                 pass
+            # Missing admin rights in a group is a permission fact, not a
+            # bot crash. Logging it at ERROR on every single message filled
+            # the log (and the owner's error feed) with noise.
+            text = str(exc)
+            if (
+                "CHAT_ADMIN_REQUIRED" in text
+                or "CHAT_WRITE_FORBIDDEN" in text
+                or "USER_BANNED_IN_CHANNEL" in text
+            ):
+                LOGGER.warning("Background task skipped (no rights): %s", exc)
+                return
             LOGGER.error("Background task failed: %s", exc)
 
         task.add_done_callback(_done)
