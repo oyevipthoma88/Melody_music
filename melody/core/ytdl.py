@@ -1224,6 +1224,22 @@ if _HAS_COOKIES:
 else:
     LOGGER.warning("🍪 No cookies loaded — running as anonymous guest (more likely to be blocked on Heroku)")
 
+# SPEED FIX (5-second rule): on cloud hosts without cookies, every InnerTube
+# client returns LOGIN_REQUIRED. Pre-mute all of them at startup so the first
+# song goes straight to yt-dlp (proven ~3.7s resolve) instead of wasting
+# _INNERTUBE_HEADSTART + probe time on clients that can never succeed.
+if _ON_CLOUD_HOST and not _HAS_COOKIES:
+    _PREMUTE_CLIENTS = ("IOS", "ANDROID", "ANDROID_MUSIC", "IOS_MUSIC",
+                        "VISIONOS", "WEB", "TVHTML5", "MWEB")
+    for _c in _PREMUTE_CLIENTS:
+        _it_client_muted[_c] = _time_mod.monotonic() + _IT_MUTE_TTL
+    _it_stream_muted_until = _time_mod.monotonic() + _IT_MUTE_TTL
+    LOGGER.info(
+        "⚡ Cloud host without cookies — InnerTube pre-muted for %.0fs "
+        "(yt-dlp direct resolve is faster here)",
+        _IT_MUTE_TTL,
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  yt-dlp options
@@ -6051,7 +6067,19 @@ async def resolve_stream_urls(
         # latency was coming from.
         tasks = []
         it_task = None
-        if re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or "") and not _innertube_stream_muted():
+        # SPEED FIX (5-second rule): on cloud hosts without cookies, every
+        # InnerTube client returns LOGIN_REQUIRED — the head start wastes
+        # _INNERTUBE_HEADSTART seconds on a probe that can never succeed.
+        # Song 3 in the Sep 24 log proved yt-dlp alone resolves in 3.7s when
+        # InnerTube is skipped. Only give InnerTube a head start when it has
+        # a real chance: not globally muted AND (has cookies OR not on a
+        # cloud host).
+        _it_viable = (
+            re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or "")
+            and not _innertube_stream_muted()
+            and (_HAS_COOKIES or not _ON_CLOUD_HOST)
+        )
+        if _it_viable:
             it_task = asyncio.ensure_future(
                 loop.run_in_executor(YTDL_POOL, _resolve_stream_urls_innertube, vid_only, want_video)
             )
