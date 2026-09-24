@@ -3172,6 +3172,7 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
     os.makedirs(attempt_dir, exist_ok=True)
     outtmpl = os.path.join(attempt_dir, "file.%(ext)s")
     _downloads_in_progress[f"{video_id}:{tag}"] = True
+    _early_handoff_lock = threading.Lock()
 
     def _cancel_hook(_d):
         if cancel_event is not None and cancel_event.is_set():
@@ -3208,25 +3209,26 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
         total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
         ready = _early_handoff_ready(downloaded, total)
         if fp and ready and os.path.exists(fp):
-            if early_holder is not None:
-                stable = f"/tmp/melody_{video_id}_{tag}.early"
-                try:
-                    link_tmp = f"{stable}.{os.getpid()}.tmp"
-                    if os.path.lexists(link_tmp):
-                        os.unlink(link_tmp)
-                    os.symlink(fp, link_tmp)
-                    os.replace(link_tmp, stable)
-                    early_holder["early_path"] = stable
-                except OSError:
-                    # If symlink creation is unavailable, the real staging path
-                    # is still usable until the atomic completion rename.
-                    early_holder["early_path"] = fp
-            LOGGER.info(
-                "⚡ #download early audio handoff %s variant=%s bytes=%d path=%s",
-                video_id, tag, downloaded,
-                os.path.basename((early_holder or {}).get("early_path") or fp),
-            )
-            early_event.set()
+            with _early_handoff_lock:
+                if early_event is None or early_event.is_set():
+                    return
+                if early_holder is not None:
+                    stable = f"/tmp/melody_{video_id}_{tag}.early"
+                    try:
+                        link_tmp = f"{stable}.{os.getpid()}.tmp"
+                        if os.path.lexists(link_tmp):
+                            os.unlink(link_tmp)
+                        os.symlink(fp, link_tmp)
+                        os.replace(link_tmp, stable)
+                        early_holder["early_path"] = stable
+                    except OSError:
+                        early_holder["early_path"] = fp
+                LOGGER.info(
+                    "⚡ #download early audio handoff %s variant=%s bytes=%d path=%s",
+                    video_id, tag, downloaded,
+                    os.path.basename((early_holder or {}).get("early_path") or fp),
+                )
+                early_event.set()
 
     opts = {
         **_ydl_opts(audio_only=audio_only),
@@ -3271,23 +3273,26 @@ def _download_audio_sync(video_id: str, audio_only: bool = True,
                     continue
                 if not _early_handoff_ready(size):
                     continue
-                if early_holder is not None:
-                    stable = f"/tmp/melody_{video_id}_{tag}.early"
-                    try:
-                        link_tmp = f"{stable}.{os.getpid()}.tmp"
-                        if os.path.lexists(link_tmp):
-                            os.unlink(link_tmp)
-                        os.symlink(cand, link_tmp)
-                        os.replace(link_tmp, stable)
-                        early_holder["early_path"] = stable
-                    except OSError:
-                        early_holder["early_path"] = cand
-                LOGGER.info(
-                    "\u26a1 #download early audio handoff (watcher) %s variant=%s bytes=%d path=%s",
-                    video_id, tag, size, os.path.basename(cand),
-                )
-                early_event.set()
-                return
+                with _early_handoff_lock:
+                    if early_event is None or early_event.is_set():
+                        return
+                    if early_holder is not None:
+                        stable = f"/tmp/melody_{video_id}_{tag}.early"
+                        try:
+                            link_tmp = f"{stable}.{os.getpid()}.tmp"
+                            if os.path.lexists(link_tmp):
+                                os.unlink(link_tmp)
+                            os.symlink(cand, link_tmp)
+                            os.replace(link_tmp, stable)
+                            early_holder["early_path"] = stable
+                        except OSError:
+                            early_holder["early_path"] = cand
+                    LOGGER.info(
+                        "\u26a1 #download early audio handoff (watcher) %s variant=%s bytes=%d path=%s",
+                        video_id, tag, size, os.path.basename(cand),
+                    )
+                    early_event.set()
+                    return
 
     _watcher = None
     if early_event is not None and audio_only:
