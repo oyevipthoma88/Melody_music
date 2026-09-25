@@ -36,6 +36,7 @@ from utils.admin_tools import (
     extract_reason,
     extract_target,
     is_admin,
+    is_real_admin,
     mention,
     protected_target,
     safe_call,
@@ -457,7 +458,7 @@ async def _do_promote(client: Client, message: Message, full: bool):
         return await message.reply(
             card("Pʀᴏᴍᴏᴛᴇ Fᴀɪʟᴇᴅ", f"⚠️ {guard}"), parse_mode=enums.ParseMode.HTML
         )
-    if await is_admin(client, message.chat.id, user.id):
+    if await is_real_admin(client, message.chat.id, user.id):
         return await message.reply(
             card("Aʟʀᴇᴀᴅʏ Aᴅᴍɪɴ",
                  f"ℹ️ {mention(user)} <b>pehle se admin hai.</b>\n\n"

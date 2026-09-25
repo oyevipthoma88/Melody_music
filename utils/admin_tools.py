@@ -143,6 +143,16 @@ async def is_admin(client, chat_id: int, user_id: int) -> bool:
     return bool(member) and _is_admin_status(member.status)
 
 
+async def is_real_admin(client, chat_id: int, user_id: int) -> bool:
+    """True ONLY for actual Telegram group admins/owner — not sudo/owner override.
+
+    Used by /promote to avoid the false "already admin" when a sudo user
+    who is NOT a group admin is targeted for promotion.
+    """
+    member = await get_status(client, chat_id, user_id)
+    return bool(member) and _is_admin_status(member.status)
+
+
 async def is_group_owner(client, chat_id: int, user_id: int) -> bool:
     """True ONLY for the actual group creator (plus bot owner / sudo, who are
     intentionally allowed everywhere)."""

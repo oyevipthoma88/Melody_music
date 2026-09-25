@@ -447,9 +447,20 @@ async def clean_cmd(client: Client, message: Message):
                 try:
                     msgs = await client.get_messages(message.chat.id, batch)
                 except Exception:
-                    continue
+                    msgs = None
             except Exception:
+                msgs = None
+
+            if not msgs:
+                # Bot accounts often can't use get_messages() — fall back to
+                # deleting the raw id range directly (same as /cleanall).
+                # We can't filter by mode, but we can still delete everything
+                # in the batch for "all" mode, or skip for filtered modes.
+                if mode == "all":
+                    targets.extend(batch)
+                    scanned += len(batch)
                 continue
+
             for msg in msgs or []:
                 if not msg or getattr(msg, "empty", False):
                     continue
