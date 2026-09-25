@@ -309,6 +309,14 @@ HELP_PAGES = {
         "🔸 Sirf receiver (aur sender) hi khol sakta hai.\n"
         "🔸 Sender kabhi bhi 🗑 se destroy kar sakta hai · 48h me auto-expire."
     ),
+    "chatbot": (
+        f"{headline('Chat Bot')}\n\n"
+        "<code>/chatbot on|off</code> <code>/chat</code> <code>/aichat</code> — 🤖 Group chat bot toggle\n\n"
+        "Jab <b>ON</b> ho, Melody group me messages ka reply dega — bilkul insaan ki tarah.\n"
+        "<b>Trigger :</b> bot pe reply, @mention, ya random messages.\n"
+        "<b>Features :</b> typing indicator, sticker, no repeat, Hinglish responses.\n\n"
+        "<i>Sirf group admins toggle kar sakte hain.</i>"
+    ),
     "ping": (
         f"{headline('Info &amp; Status')}\n\n"
         "<code>/start</code> — 🚀 Welcome card\n"
@@ -397,11 +405,11 @@ HUBS = {
     ),
     "hub_extra": (
         f"{headline('Extras')}\n\n"
-        "Economy, social GIFs, whisper aur info cards.",
+        "Economy, social GIFs, whisper, chat bot aur info cards.",
         [
             [("🪙 Economy", "economy")],
             [("💞 Social GIFs", "social"), ("🤫 Whisper", "whisper")],
-            [("ℹ Info & Status", "ping")],
+            [("🤖 Chat Bot", "chatbot"), ("ℹ Info & Status", "ping")],
         ],
     ),
     "hub_all": (
@@ -438,6 +446,7 @@ _PAGE_LINKS = {
         [("🔤 All Commands", "hub_all")],
     ],
     "play": [[("📋 Queue", "queue"), ("🎛 Controls", "controls")]],
+    "chatbot": [[("ℹ Info & Status", "ping")]],
     "queue": [[("▶ Play", "play"), ("🔁 Loop", "loop")]],
     "controls": [[("⏩ Seek", "seek"), ("🔊 Volume", "volume")]],
     "vc": [[("▶ Play", "play"), ("🎓 Tutorial", "tutorial")]],

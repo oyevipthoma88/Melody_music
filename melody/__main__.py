@@ -266,6 +266,7 @@ async def register_slash_commands(bot):
         BotCommand("guardinfo", "🛡 Protection status"),
         BotCommand("tagall",    "📣 Mention group members"),
         BotCommand("invitelink", "🔗 Get invite link"),
+        BotCommand("chatbot",   "🤖 Toggle group chat bot"),
     ]
 
     # Commands shown when the bot is added as admin in a channel (channel
