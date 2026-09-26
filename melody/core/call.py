@@ -941,6 +941,7 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
     Returns None when the track has no CDN source (tagged Telegram media) or
     resolution fails, so the caller can fall back to the download path.
     """
+    _resolve_t0 = time.monotonic()
     try:
         from melody.core.ytdl import resolve_stream_urls
 
@@ -965,7 +966,11 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
         # first failed profile immediately forces a 30-40s download even when a
         # second profile would provide a playable URL in under 5s. The force
         # flag prevents recursion and retry storms.
-        if not force and not str(getattr(track, "stream_url", "") or "").lower().startswith(
+        # 5-SECOND RULE: only retry when the first attempt failed FAST (e.g. a
+        # stale 403). A slow/timeout failure means the host can't resolve —
+        # retrying just doubled/tripled the wait (Sep 26 log: 3x9.8s).
+        _fast_fail = (time.monotonic() - _resolve_t0) < float(os.getenv("RESOLVE_RETRY_IF_UNDER", "1.5"))
+        if _fast_fail and not force and not str(getattr(track, "stream_url", "") or "").lower().startswith(
             ("http://127.0.0.1:", "http://localhost:")
         ):
             try:
