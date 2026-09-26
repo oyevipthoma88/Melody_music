@@ -412,8 +412,10 @@ async def _get_bot_id(client: Client) -> int:
          "set_welcome_pic", "source_code", "global_tools",
          "joinrequests", "vcactivity", "vcjoinleft", "m3u8", "stream",
          "unwarn", "resetwarns", "rmwarns"]
-    )
-    & ~filters.edited,
+    ),
+    # NOTE: `filters.edited` does not exist in Pyrogram 2.x / pyrofork and
+    # raised AttributeError at import time, so this plugin failed to load.
+    # Edited messages arrive via on_edited_message, so no filter is needed.
     group=99,
 )
 @error_handler
