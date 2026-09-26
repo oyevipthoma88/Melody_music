@@ -108,7 +108,7 @@ def test_public_provider_failover_is_strictly_bounded():
     assert 'INVIDIOUS_MAX_INSTANCES", "3"' in ytdl
     assert "_INVIDIOUS_INSTANCES[:_INVIDIOUS_MAX_INSTANCES]" in ytdl
     assert "timeout=0.75" in ytdl
-    assert 'DIRECT_RESCUE_TIMEOUT", 1.5' in ytdl
+    assert 'DIRECT_RESCUE_TIMEOUT", 0.8' in ytdl
 
 
 def test_cookie_stream_fast_path_uses_one_direct_web_client():
