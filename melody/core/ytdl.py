@@ -40,10 +40,11 @@ try:
     # Keep direct resolution bounded because the local download races it. An
     # 8s resolver plus the Invidious rescue used to delay playback even when
     # the fallback file was already progressing.
-    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "9.0"))
+    _RESOLVE_TIMEOUT = float(os.getenv("RESOLVE_TIMEOUT", "3.0"))
 except ValueError:
-    _RESOLVE_TIMEOUT = 6.0
-_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "9.0")))
+    _RESOLVE_TIMEOUT = 3.0
+# 5-SECOND RULE (Sep 26 log: 3x ~9.8s resolve waits = 29s before play).
+_DIRECT_RESOLVE_MAX = max(1.0, float(os.getenv("DIRECT_RESOLVE_MAX", "3.5")))
 _RESOLVE_TIMEOUT = min(_RESOLVE_TIMEOUT, _DIRECT_RESOLVE_MAX)
 
 # How long InnerTube gets the CPU/network to itself before the heavy yt-dlp
@@ -6116,7 +6117,7 @@ async def resolve_stream_urls(
         # Absolute budget measured from the very start of the resolve (the
         # InnerTube head start counts against it), with a small floor so the
         # yt-dlp fallback always gets a fair chance to answer.
-        deadline = max(_t0 + _RESOLVE_TIMEOUT, _time_mod.monotonic() + 1.5)
+        deadline = max(_t0 + _RESOLVE_TIMEOUT, _time_mod.monotonic() + 1.0)
         try:
             while pending:
                 remaining = deadline - _time_mod.monotonic()
@@ -6156,7 +6157,7 @@ async def resolve_stream_urls(
                     loop.run_in_executor(
                         YTDL_POOL, _invidious_streams_sync, vid_only, want_video,
                     ),
-                    timeout=_env_float("DIRECT_RESCUE_TIMEOUT", 1.5),
+                    timeout=_env_float("DIRECT_RESCUE_TIMEOUT", 0.8),
                 )
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
