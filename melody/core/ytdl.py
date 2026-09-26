@@ -6162,7 +6162,38 @@ async def resolve_stream_urls(
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
 
+        if not resolved and pending:
+            # SPEED FIX (Sep 26 log: 14.42s stream time): the extraction task
+            # regularly finishes a fraction of a second AFTER the race budget
+            # ends (late cache landed 0.5s after give-up). The old code raised
+            # immediately, so the playback path started a SECOND full resolve
+            # (another ~3.4s) and then a 7s download — even though a usable
+            # URL was cached in between. Give the still-running tasks a short
+            # grace window before declaring failure.
+            grace = _env_float("RESOLVE_GRACE", 1.5)
+            try:
+                done_g, pending = await asyncio.wait(pending, timeout=grace)
+            except Exception:  # noqa: BLE001
+                done_g = set()
+            for t in done_g:
+                try:
+                    resolved = t.result()
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    continue
+                if resolved:
+                    LOGGER.info(
+                        "⚡ #stream grace resolve won for %s (%.2fs over budget)",
+                        video_id, _time_mod.monotonic() - _t0,
+                    )
+                    break
         if not resolved:
+            # A concurrent resolve for the same key may have cached a result
+            # while we were waiting — use it instead of failing.
+            cached = _stream_url_cache.get(key)
+            if cached and cached.get("expires_at", 0) > _time_mod.time():
+                LOGGER.info("⚡ #stream late cache HIT for %s after give-up", key)
+                return cached
             # Only remember a *real* failure. A resolve that merely ran out of
             # budget while still working must not poison the next attempt with
             # a cached "direct stream temporarily unavailable".
