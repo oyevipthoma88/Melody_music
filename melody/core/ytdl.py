@@ -2681,7 +2681,7 @@ def _env_flag(name: str, default: bool = True) -> bool:
 # before playback could start. 512 KB is still ~30 s of playback buffer (the
 # writer stays far ahead of the 1x-realtime reader, so no premature EOF) but
 # lands on disk in well under a second.
-_EARLY_HANDOFF_BYTES = _env_int("EARLY_HANDOFF_BYTES", 16_000)  # SPEED: WebM/Opus header + audio fits in a small prefix
+_EARLY_HANDOFF_BYTES = _env_int("EARLY_HANDOFF_BYTES", 256_000)  # SPEED: WebM/Opus header + audio fits in a small prefix
 # Minimum share of the total file that must be on disk before handing off.
 _EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.001)
 # BUG FIX ("3 ghante ki movie download hone tak wait karta hai"): the ratio
@@ -2693,7 +2693,7 @@ _EARLY_HANDOFF_RATIO = _env_float("EARLY_HANDOFF_RATIO", 0.001)
 # far faster than 1x realtime playback, so that prefix keeps growing well
 # ahead of the reader for the rest of a multi-hour file.
 _EARLY_HANDOFF_LARGE_FILE_BYTES = _env_int("EARLY_HANDOFF_LARGE_FILE_BYTES", 10_000_000)
-_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 32_000)
+_EARLY_HANDOFF_LARGE_FILE_PREFIX = _env_int("EARLY_HANDOFF_LARGE_FILE_PREFIX", 4_000_000)
 # ROOT-CAUSE FIX from the Aug 25 Heroku log:
 #   ffprobe check_stream failed (NoAudioSourceFound: No audio source found on
 #   "/tmp/melody_<id>_a.mp4.part")
@@ -2789,9 +2789,11 @@ def _early_handoff_ready(downloaded: int, total: int = 0) -> bool:
         # Do not require 60% of a normal song: that turns direct-stream
         # failures back into full-download playback. Keep a small safety floor
         # for tiny files while preserving the bounded handoff latency.
+        # A 16-32 KB prefix is ~1s of audio: ffmpeg outruns the download and
+        # the song stops mid-way. Require a bounded ~15s buffer instead.
         required = min(
-            _EARLY_HANDOFF_BYTES,
-            max(32_000, int(total * _EARLY_HANDOFF_RATIO)),
+            total,
+            max(_EARLY_HANDOFF_BYTES, int(total * _EARLY_HANDOFF_RATIO)),
         )
     else:
         required = _EARLY_HANDOFF_BYTES
