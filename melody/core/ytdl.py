@@ -1429,8 +1429,26 @@ def _ydl_opts(audio_only: bool = True) -> dict:
             # web/TV clients (they expose audio-only itag 140/251 with a valid
             # session); the cookie-less mobile clients stay available through
             # the download ladder rungs, which drop the cookiefile first.
+            # ROOT-CAUSE FIX (Sep 30 2026 log: "innertube: no directly
+            # streamable format" on every track, then "#download rung 1 picked
+            # format_id=18 ext=mp4 size=10.7MB", stream=32.5s):
+            # Live-verified from a datacenter IP with yt-dlp 2026.08.19 —
+            #   ios/visionos/web -> 48 formats, ZERO progressive audio-only
+            #                       (only HLS 233/234 + muxed itag 18)
+            #   web_safari / tv / tv_simply -> "Requested format is not
+            #                       available" / "page needs to be reloaded"
+            #   android_vr       -> 0.9-1.4s, itag 139/249/140/251 as PLAIN
+            #                       https audio-only URLs, 206 on first byte
+            # android_vr needs no PO token and no cookies, so it is the only
+            # client here that reliably yields a directly streamable ~3 MB
+            # audio URL instead of a 10-20 MB muxed video download.
+            # Cookie branch stays web/TV only: cookies must never be replayed
+            # to a mobile/VR client (that regression is pinned by
+            # test_youtube_client_policy_keeps_cloud_direct_fallback_order).
             ["web_safari", "web", "tv"] if has_cookies
-            else ["ios", "visionos", "web"]
+
+            else ["android_vr", "ios", "visionos", "web"]
+
         ),
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
@@ -2912,7 +2930,17 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 _DOWNLOAD_LADDER: tuple = (
     {},                                                        # as configured
     {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
+    # android_vr is the only cookie-less client that still advertises plain
+    # https audio-only itags (139/249/140/251) from a datacenter IP, so it is
+    # the cheapest rung that can avoid a muxed itag-18 video download.
+    {"_client": ["android_vr"],
+     "_format": "bestaudio[format_id=251]/bestaudio[format_id=140]/"
+                "bestaudio[format_id=250]/bestaudio[format_id=249]/"
+                "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=m4a][protocol^=http]/"
+                "bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
+     "_no_merge": True},
     {"_client": ["ios", "visionos", "web"]},                      # different API surface
+
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
     {"_format": "bestaudio[ext=webm]/bestaudio[ext=opus]/bestaudio[ext=ogg]/"
                 "bestaudio[ext=m4a]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
@@ -5969,7 +5997,24 @@ def _resolve_stream_urls_sync(target: str, want_video: bool) -> dict:
     return picked
 
 
+def peek_cached_stream_urls(video_id: str, want_video: bool = False) -> "dict | None":
+    """Return a still-valid cached direct-stream result, or None.
+
+    SPEED ROOT-CAUSE FIX (Sep 30 2026 log): the direct resolve gave up after
+    5.3s, but its extraction kept running and cached a perfectly good CDN URL
+    ~13s later — several seconds BEFORE the 25s fallback download finished.
+    Nobody ever looked at that cache again, so every track paid the full
+    download. The playback race now polls this helper while the download runs.
+    """
+    key = f"{video_id}:{'v' if want_video else 'a'}"
+    cached = _stream_url_cache.get(key)
+    if cached and cached.get("expires_at", 0) > _time_mod.time():
+        return cached
+    return None
+
+
 def _cache_late_resolve(key: str):
+
     """Cache a direct-resolve result that arrived after the race budget."""
 
     def _done(task) -> None:
@@ -6071,15 +6116,19 @@ async def resolve_stream_urls(
         # SPEED FIX (5-second rule): on cloud hosts without cookies, every
         # InnerTube client returns LOGIN_REQUIRED — the head start wastes
         # _INNERTUBE_HEADSTART seconds on a probe that can never succeed.
-        # Song 3 in the Sep 24 log proved yt-dlp alone resolves in 3.7s when
-        # InnerTube is skipped. Only give InnerTube a head start when it has
-        # a real chance: not globally muted AND (has cookies OR not on a
-        # cloud host).
+        # ROOT-CAUSE FIX (Sep 30 2026): the cookie gate below disabled the
+        # fastest working path on exactly the hosts that need it. A live probe
+        # from a datacenter IP shows the bare IOS/ANDROID InnerTube player
+        # answers OK in ~0.08s with 5-6 unciphered audio-only URLs and no
+        # cookies at all. The per-client and global mute counters already
+        # suppress InnerTube when it genuinely stops working here, so the
+        # extra "cookies or not cloud" condition only removed a sub-second
+        # fast path and forced every /play onto the 20s+ yt-dlp route.
         _it_viable = (
             re.fullmatch(r"[A-Za-z0-9_-]{11}", vid_only or "")
             and not _innertube_stream_muted()
-            and (_HAS_COOKIES or not _ON_CLOUD_HOST)
         )
+
         if _it_viable:
             it_task = asyncio.ensure_future(
                 loop.run_in_executor(YTDL_POOL, _resolve_stream_urls_innertube, vid_only, want_video)
