@@ -75,7 +75,9 @@ async def _delete_chunk(client: Client, chat_id: int, ids: list[int], depth: int
             if isinstance(removed, bool) or removed is None:
                 return len(ids) if removed is not False else 0
             if isinstance(removed, int):
-                return removed or len(ids)
+                # Telegram returns the REAL count; empty/missing ids count 0.
+                # `removed or len(ids)` over-reported "Deleted" on gaps.
+                return removed
             return len(ids)
         except FloodWait as fw:
             await asyncio.sleep(int(getattr(fw, "value", getattr(fw, "x", 2))) + 1)
@@ -83,12 +85,26 @@ async def _delete_chunk(client: Client, chat_id: int, ids: list[int], depth: int
             return 0
         except Exception:
             break
-    if len(ids) == 1 or depth >= 6:
+    if len(ids) == 1 or depth >= 3:
         return 0
     mid = len(ids) // 2
     left = await _delete_chunk(client, chat_id, ids[:mid], depth + 1)
     right = await _delete_chunk(client, chat_id, ids[mid:], depth + 1)
     return left + right
+
+
+async def _bot_can_delete(client: Client, chat_id: int) -> "str | None":
+    """Return an error text when the bot can't wipe this chat, else None."""
+    try:
+        me = await client.get_chat_member(chat_id, "me")
+    except Exception:
+        return "⚠️ <b>Mera admin status check nahi ho paya.</b> Mujhe admin banao."
+    if me.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
+        return "⚠️ <b>Main admin nahi hu.</b> Mujhe admin banao aur <b>Delete Messages</b> right do."
+    priv = getattr(me, "privileges", None)
+    if me.status == enums.ChatMemberStatus.ADMINISTRATOR and priv is not None and not getattr(priv, "can_delete_messages", False):
+        return "⚠️ <b>Mere paas Delete Messages right nahi hai.</b> Admin settings me ON karo."
+    return None
 
 
 async def _wipe(client: Client, chat_id: int, upto: int, status: Message | None):
@@ -164,6 +180,16 @@ async def cleanall_cmd(client: Client, message: Message):
     if message.chat.id in _running:
         return await message.reply("🧹 <i>Pehle wali cleaning chal rahi hai…</i>", parse_mode=enums.ParseMode.HTML)
 
+    if message.chat.type != enums.ChatType.SUPERGROUP:
+        return await message.reply(
+            card("Cʟᴇᴀɴᴀʟʟ", "⚠️ <b>/cleanall sirf supergroup me chalta hai.</b>\n"
+                 "<i>Normal group me Telegram bot ko 48 ghante se purani messages delete nahi karne deta.</i>"),
+            parse_mode=enums.ParseMode.HTML,
+        )
+    err = await _bot_can_delete(client, message.chat.id)
+    if err:
+        return await message.reply(card("Cʟᴇᴀɴᴀʟʟ", err), parse_mode=enums.ParseMode.HTML)
+
     _pending[message.chat.id] = (message.from_user.id, message.id, time.time() + _CONFIRM_TTL)
     await client.send_message(
         message.chat.id,
@@ -207,6 +233,10 @@ async def cleanall_cb(client: Client, query: CallbackQuery):
         )
 
     _pending.pop(chat_id, None)
+    err = await _bot_can_delete(client, chat_id)
+    if err:
+        await query.answer("Delete rights nahi hain", show_alert=True)
+        return await query.message.edit_text(card("Cʟᴇᴀɴᴀʟʟ", err), parse_mode=enums.ParseMode.HTML)
     if chat_id in _running:
         return await query.answer("Already running…", show_alert=True)
     _running.add(chat_id)
