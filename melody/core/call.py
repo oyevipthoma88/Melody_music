@@ -1597,6 +1597,8 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
         direct_task = None
         download_task = None
         early_task = None
+        late_direct_task = None
+
         download_cancelled = False
         early_file = False
         pending: set = set()
@@ -1802,6 +1804,44 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
                 if task is direct_task and result is not None:
                     stream = result
                     break
+                if (
+                    task is direct_task
+                    and result is None
+                    and late_direct_task is None
+                    and download_task is not None
+                    and not download_task.done()
+                ):
+                    # SPEED ROOT-CAUSE FIX (Sep 30 2026 log, stream=32.5s):
+                    # the direct resolve gives up at ~5s but its extraction
+                    # keeps running and caches a usable CDN URL ~13s later —
+                    # still well before the ~25s download finishes. Keep
+                    # watching that cache instead of committing to the
+                    # download, so the song starts the moment a direct URL
+                    # exists.
+                    async def _await_late_direct():
+                        from melody.core.ytdl import peek_cached_stream_urls
+
+                        while time.monotonic() < startup_deadline:
+                            await asyncio.sleep(0.25)
+                            if peek_cached_stream_urls(track.video_id, want_video=video):
+                                built = await _build_direct_stream(
+                                    chat_id, track, video, start_at,
+                                )
+                                if built is not None:
+                                    LOGGER.info(
+                                        "⚡ #stream late direct URL won the race for %s",
+                                        track.video_id,
+                                    )
+                                    return built
+                        return None
+
+                    late_direct_task = asyncio.create_task(_await_late_direct())
+                    pending.add(late_direct_task)
+                    continue
+                if task is late_direct_task and result is not None:
+                    stream = result
+                    break
+
                 if task is early_task and result:
                     filepath = result
                     early_file = bool(filepath.endswith(".early"))
@@ -1846,6 +1886,9 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             direct_task.add_done_callback(_consume_task_exception)
         if early_task is not None and not early_task.done():
             early_task.cancel()
+        if late_direct_task is not None and not late_direct_task.done():
+            late_direct_task.cancel()
+
         if filepath is None and download_task is not None:
             if not download_task.done():
                 download_task.add_done_callback(_consume_task_exception)
