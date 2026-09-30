@@ -244,15 +244,26 @@ def _should_respond_randomly() -> bool:
     return random.random() < 0.20
 
 
+_bot_username: str = ""
+
+
+def _get_bot_username() -> str:
+    """BOT_USERNAME env is often unset on Heroku; fall back to get_me()."""
+    return (_bot_username or getattr(Config, "BOT_USERNAME", "") or "").lstrip("@")
+
+
 def _is_bot_mentioned(message: Message) -> bool:
-    """Check if the bot is mentioned in the message text."""
+    """Check if the bot is mentioned (by @username or a text mention)."""
     if not message.text:
         return False
-    bot_username = getattr(Config, "BOT_USERNAME", "") or ""
-    bot_username = bot_username.lstrip("@").lower()
-    if not bot_username:
-        return False
-    return f"@{bot_username}" in message.text.lower()
+    bot_username = _get_bot_username().lower()
+    if bot_username and f"@{bot_username}" in message.text.lower():
+        return True
+    for ent in message.entities or []:
+        user = getattr(ent, "user", None)
+        if user is not None and _bot_id is not None and user.id == _bot_id:
+            return True
+    return False
 
 
 def _is_reply_to_bot(message: Message, bot_id: int) -> bool:
@@ -301,6 +312,16 @@ async def chatbot_cmd(client: Client, message: Message):
     if arg in ("on", "enable", "yes"):
         state = True
         await set_setting_flag(chat_id, FLAG, True)
+        await _get_bot_id(client)
+        if _can_read_all is False:
+            await message.reply(
+                "⚠️ Bot ki <b>Privacy Mode</b> ON hai, isliye group ke normal "
+                "messages bot tak nahi pahunchte — sirf bot ke message pe reply "
+                "ya @mention par jawab milega.\n\nFix: @BotFather → /mybots → "
+                "bot → Bot Settings → Group Privacy → <b>Turn off</b>, phir bot "
+                "ko group se nikaal kar wapas add karein.",
+                parse_mode=enums.ParseMode.HTML,
+            )
     elif arg in ("off", "disable", "no"):
         state = False
         await set_setting_flag(chat_id, FLAG, False)
@@ -337,13 +358,16 @@ async def chatbot_toggle_cb(client: Client, cb: CallbackQuery):
 # interferes with music/admin commands.
 
 _bot_id: int | None = None
+_can_read_all = None
 
 
 async def _get_bot_id(client: Client) -> int:
-    global _bot_id
+    global _bot_id, _bot_username, _can_read_all
     if _bot_id is None:
         me = await client.get_me()
         _bot_id = me.id
+        _bot_username = me.username or ""
+        _can_read_all = getattr(me, "can_read_all_group_messages", None)
     return _bot_id
 
 
@@ -458,8 +482,7 @@ async def chatbot_handler(client: Client, message: Message):
 
     # Clean the text (remove bot mention)
     clean_text = text
-    bot_username = getattr(Config, "BOT_USERNAME", "") or ""
-    bot_username = bot_username.lstrip("@")
+    bot_username = _get_bot_username()
     if bot_username:
         clean_text = re.sub(rf"@{re.escape(bot_username)}\s*", "", clean_text, flags=re.IGNORECASE).strip()
 
@@ -496,8 +519,9 @@ async def chatbot_handler(client: Client, message: Message):
             parse_mode=enums.ParseMode.HTML,
             disable_web_page_preview=True,
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("chatbot reply failed in %s: %s", chat_id, exc)
 
     # Cancel typing indicator
     try:
