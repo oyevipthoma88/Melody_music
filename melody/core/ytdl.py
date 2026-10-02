@@ -3118,6 +3118,10 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 # Each rung below changes exactly one thing, cheapest first.
 _DOWNLOAD_LADDER: tuple = (
     {},                                                        # yt-dlp default clients, no cookies
+    # SPEED FIX (Oct 2 2026 11:10 log): through WARP rung 1 hit a flaky
+    # googlevideo 403 and the single-fragment retry (old rung 5) was the one
+    # that played — after two wasted cookie rungs (~15s). Try it 2nd.
+    {"concurrent_fragment_downloads": 1},
     # Cookies from the DYNO IP (no VPN): a logged-in jar replayed through a
     # shared WARP IP is what produced "Error code: 152 - 18".
     {"_cookies": True, "_no_proxy": True},
@@ -3134,7 +3138,6 @@ _DOWNLOAD_LADDER: tuple = (
                 "bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "_no_merge": True},
     {"_cookies": True},                                        # default clients + login cookies
-    {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
     {"_client": ["ios", "visionos", "web"]},                      # different API surface
 
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
@@ -3332,7 +3335,13 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
     # Multiple cookie accounts: a cookie rung is tried once per healthy
     # account, so one flagged account (152-18) falls through to the next.
     ladder: list = []
+    _now = time.time()
+    _all_jars_resting = bool(_JARS) and all(j["bad_until"] > _now for j in _JARS)
     for step in _DOWNLOAD_LADDER:
+        # SPEED FIX: every cookie account is cooling down after a bot-check —
+        # replaying it only burns ~1s per rung for a guaranteed failure.
+        if step.get("_cookies") and _all_jars_resting:
+            continue
         if step.get("_cookies") and len(_JARS) > 1:
             ladder.extend({**step, "_jar": j} for j in _healthy_jar_order())
         else:
