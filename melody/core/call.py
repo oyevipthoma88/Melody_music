@@ -2489,7 +2489,14 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             # the user on the very first hiccup. Purge the poisoned cache
             # files for this track and give it exactly ONE clean retry before
             # reporting anything.
-            if not _dl_retry:
+            # A YouTube bot-block already walked every rung inside the
+            # download ladder; re-running it just doubles the wait (log:
+            # 14s -> 28s) with the same result.
+            _blocked = any(m in str(exc).lower() for m in (
+                "error code: 152", "error code 152", "sign in to confirm you",
+                "403: forbidden",
+            ))
+            if not _dl_retry and not _blocked:
                 LOGGER.warning(
                     "playback failed for %s in %s (%s: %s) — one clean retry",
                     getattr(track, "video_id", "?"), chat_id,

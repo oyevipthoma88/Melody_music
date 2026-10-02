@@ -3204,7 +3204,80 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
                 "download attempt %d/%d failed for %s: %s",
                 index + 1, len(_DOWNLOAD_LADDER), url, redact_sensitive_text(exc),
             )
+    # ROOT-CAUSE FIX (Oct 2 2026 04:33 log): every rung failed with
+    # "Sign in to confirm you're not a bot" / "152 - 18" / 403 — YouTube has
+    # flagged BOTH the dyno IP and the cookies, so no YouTube rung can work
+    # and the song died after ~30s. For audio requests, fall back to the same
+    # song on SoundCloud (different host, not blocked). Video requests stay
+    # YouTube-only so /vplay never silently becomes audio.
+    if audio_only and last_exc is not None and _is_youtube_block_error(last_exc):
+        alt = _alt_source_download(url, base_opts)
+        if alt is not None:
+            return alt
     raise last_exc if last_exc else RuntimeError(f"download failed for {url}")
+
+
+def _is_youtube_block_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    for _ in range(8):
+        if current is None:
+            break
+        text = str(current).lower()
+        if any(m in text for m in _RETRYABLE_BLOCK_MARKERS) or "403: forbidden" in text:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _youtube_title_for(url: str) -> str | None:
+    """oEmbed works even when the watch page is bot-blocked."""
+    try:
+        import json as _json
+        import urllib.parse as _up
+        import urllib.request as _ur
+        q = _up.urlencode({"url": url, "format": "json"})
+        with _ur.urlopen(f"https://www.youtube.com/oembed?{q}", timeout=6) as r:
+            data = _json.loads(r.read().decode("utf-8", "ignore"))
+        title = (data.get("title") or "").strip()
+        author = (data.get("author_name") or "").replace(" - Topic", "").strip()
+        if not title:
+            return None
+        return title if author.lower() in title.lower() else f"{title} {author}".strip()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("oEmbed title lookup failed for %s: %s", url, exc)
+        return None
+
+
+def _alt_source_download(url: str, base_opts: dict):
+    if "youtube.com" not in url and "youtu.be" not in url:
+        return None
+    if os.getenv("ALT_SOURCE_FALLBACK", "1").lower() in ("0", "false", "no"):
+        return None
+    title = _youtube_title_for(url)
+    if not title:
+        return None
+    opts = dict(base_opts)
+    for key in ("cookiefile", "extractor_args", "format_sort", "proxy"):
+        opts.pop(key, None)
+    opts["format"] = "bestaudio/best"
+    opts["noplaylist"] = True
+    try:
+        with _locked_ytdl(opts) as ydl:
+            info = ydl.extract_info(f"scsearch1:{title}", download=True)
+            if info and info.get("entries"):
+                info = info["entries"][0]
+            if not info:
+                return None
+            path = info.get("filepath") or ydl.prepare_filename(info)
+            requested = info.get("requested_downloads") or []
+            if requested and isinstance(requested[0], dict):
+                path = requested[0].get("filepath") or path
+            if path and os.path.exists(path) and os.path.getsize(path) >= 1024:
+                LOGGER.info("YouTube blocked — played %r from SoundCloud instead", title)
+                return info, path
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("SoundCloud fallback failed for %r: %s", title, redact_sensitive_text(exc))
+    return None
 
 
 def _download_audio_sync(video_id: str, audio_only: bool = True,
