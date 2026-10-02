@@ -24,7 +24,7 @@ import time
 from pyrogram import enums
 from pyrogram import Client, ContinuePropagation, StopPropagation
 from pyrogram.errors import FloodWait
-from pyrogram.types import Message, CallbackQuery
+from pyrogram.types import Message, CallbackQuery, LinkPreviewOptions
 from melody.config import Config
 from utils.formatters import quote_html
 from melody.logging import LOGGER, send_error_log
@@ -468,7 +468,7 @@ def error_handler(func):
                     await update.reply(
                         info["user"],
                         parse_mode=enums.ParseMode.HTML,
-                        disable_web_page_preview=True,
+                        link_preview_options=LinkPreviewOptions(is_disabled=True),
                     )
             except Exception:
                 pass

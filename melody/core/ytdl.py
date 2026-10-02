@@ -1003,6 +1003,11 @@ _ON_CLOUD_HOST: bool = bool(
 if _ON_CLOUD_HOST:
     LOGGER.info("☁️  Cloud host detected — direct CDN + download fallback race enabled")
 
+# Free clean-IP egress for YouTube (Cloudflare WARP / YT_PROXY). See warp.py
+# for the root-cause write-up. Runs in a background thread; never blocks boot.
+from melody.core import warp as _warp
+_warp.start_in_background()
+
 
 def should_try_direct_stream() -> bool:
     # Direct stream is the fastest path. If a cloud CDN route rejects it,
@@ -1377,7 +1382,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
     user_agent = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        if has_cookies
+        if has_cookies and _cookies_mode() == "always"
         else "Mozilla/5.0 (Linux; Android 13; SM-S908B) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
     )
@@ -1409,47 +1414,16 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # round-trips ahead of the one client that actually answers on this
         # host, which is why stream= stayed at 3.2-3.6s). With cookies
         # present, ask only the two cookie/PO-token clients that work here.
-        "player_client": (
-            # ROOT-CAUSE FIX (Sep 20 2026): visionos alone only returns muxed
-            # 360p (itag 18, 10-21MB) — no audio-only formats, so the direct
-            # stream URL has no clean audio track (NoAudioSourceFound) and the
-            # download grabs a huge video file (13-14s). Adding ios gives
-            # yt-dlp access to unciphered audio-only m4a (itag 140, ~3MB) that
-            # streams directly AND downloads in ~2s.
-            #
-            # ROOT-CAUSE FIX (Sep 20 2026 05:13 log: "#download rung 1 picked
-            # format_id=18 ... size=18580114", stream=16.68s): a cookiefile is
-            # attached to these very opts below, and browser web cookies
-            # replayed to the ios/visionos app clients make YouTube answer
-            # "Sign in to confirm you're not a bot" — the same reason
-            # _apply_ladder_step() pops the cookiefile for mobile rungs. With
-            # every mobile client refused, the only surviving format was the
-            # muxed itag 18, hence the audio-less direct URL and the 18 MB
-            # download. When cookies are present ask the cookie-compatible
-            # web/TV clients (they expose audio-only itag 140/251 with a valid
-            # session); the cookie-less mobile clients stay available through
-            # the download ladder rungs, which drop the cookiefile first.
-            # ROOT-CAUSE FIX (Sep 30 2026 log: "innertube: no directly
-            # streamable format" on every track, then "#download rung 1 picked
-            # format_id=18 ext=mp4 size=10.7MB", stream=32.5s):
-            # Live-verified from a datacenter IP with yt-dlp 2026.08.19 —
-            #   ios/visionos/web -> 48 formats, ZERO progressive audio-only
-            #                       (only HLS 233/234 + muxed itag 18)
-            #   web_safari / tv / tv_simply -> "Requested format is not
-            #                       available" / "page needs to be reloaded"
-            #   android_vr       -> 0.9-1.4s, itag 139/249/140/251 as PLAIN
-            #                       https audio-only URLs, 206 on first byte
-            # android_vr needs no PO token and no cookies, so it is the only
-            # client here that reliably yields a directly streamable ~3 MB
-            # audio URL instead of a 10-20 MB muxed video download.
-            # Cookie branch stays web/TV only: cookies must never be replayed
-            # to a mobile/VR client (that regression is pinned by
-            # test_youtube_client_policy_keeps_cloud_direct_fallback_order).
-            ["web_safari", "web", "tv"] if has_cookies
-
-            else ["android_vr", "ios", "visionos", "web"]
-
-        ),
+        # ROOT-CAUSE FIX (Oct 2 2026 log: "Requested format is not available"
+        # on rung 1+2, then "Sign in to confirm you're not a bot" on rung 3):
+        # the cookie branch forced player_client=["web_safari","web","tv"].
+        # Reproduced live with yt-dlp 2026.08.19: that exact list fails with
+        # "The page needs to be reloaded" / no formats, while yt-dlp's OWN
+        # default client selection returns audio-only itag 250/251 over plain
+        # https in ~2s. yt-dlp maintainers retune the defaults every release
+        # (and pick cookie-aware clients automatically when a cookiefile is
+        # attached), so hard-coding a client list is what kept breaking.
+        # YT_PLAYER_CLIENTS="a,b,c" remains as a manual override.
         "formats": ["missing_pot"],
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.
@@ -1458,6 +1432,10 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         "player_skip": ["configs", "initial_data"],
         "skip": ["translated_subs"],
     }
+
+    _pc_override = [c.strip() for c in os.getenv("YT_PLAYER_CLIENTS", "").split(",") if c.strip()]
+    if _pc_override:
+        extractor_args["player_client"] = _pc_override
 
     provider_args: dict = {"youtube": extractor_args}
 
@@ -1587,10 +1565,28 @@ def _ydl_opts(audio_only: bool = True) -> dict:
     # NOTE: curl_cffi "impersonate" intentionally removed.
     # The impersonate target varies by installed version and crashes yt-dlp
     # with "Impersonate target not available" on older curl_cffi builds.
-    if cookiefile:
+    # ROOT-CAUSE FIX (cookies "added hai phir bhi" bot-check): a browser
+    # cookie jar replayed from a datacenter IP gets flagged/rotated by
+    # YouTube within hours, and from then on EVERY request that carries it
+    # is answered with "Sign in to confirm you're not a bot" — the cookies
+    # actively make things worse. Default mode is now "fallback": the first
+    # attempts go cookie-less (through the clean WARP/YT_PROXY egress), and
+    # the jar is only attached by a dedicated retry rung.
+    #   YT_COOKIES_MODE=always   -> old behaviour (cookies on every request)
+    #   YT_COOKIES_MODE=off      -> never send cookies
+    if cookiefile and _cookies_mode() == "always":
         opts["cookiefile"] = cookiefile
 
+    proxy = _warp.get_proxy()
+    if proxy:
+        opts["proxy"] = proxy
+
     return opts
+
+
+def _cookies_mode() -> str:
+    mode = (os.getenv("YT_COOKIES_MODE") or "fallback").strip().lower()
+    return mode if mode in {"always", "fallback", "off"} else "fallback"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2930,8 +2926,10 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 #
 # Each rung below changes exactly one thing, cheapest first.
 _DOWNLOAD_LADDER: tuple = (
-    {},                                                        # as configured
-    {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
+    {},                                                        # yt-dlp default clients, no cookies
+    # Cookie rung sits at #3 on purpose: the ladder deadline usually allows
+    # only ~3 attempts, and the old order never reached any rung that could
+    # actually authenticate before giving up.
     # android_vr is the only cookie-less client that still advertises plain
     # https audio-only itags (139/249/140/251) from a datacenter IP, so it is
     # the cheapest rung that can avoid a muxed itag-18 video download.
@@ -2941,6 +2939,8 @@ _DOWNLOAD_LADDER: tuple = (
                 "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=m4a][protocol^=http]/"
                 "bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "_no_merge": True},
+    {"_cookies": True},                                        # default clients + login cookies
+    {"concurrent_fragment_downloads": 1},                      # flaky CDN / partial fragments
     {"_client": ["ios", "visionos", "web"]},                      # different API surface
 
     {"_client": ["ios", "ios_music", "mweb"], "concurrent_fragment_downloads": 1},
@@ -3013,6 +3013,18 @@ def _apply_ladder_step(opts: dict, step: dict, audio_only: bool) -> dict:
             # into HTTP 403. Those client APIs are designed to work without
             # the web cookie jar, so let the client-specific identity win.
             out.pop("cookiefile", None)
+
+    if step.get("_cookies"):
+        if _cookies_mode() != "off":
+            jar = cookiefile_for_run()
+            if jar:
+                out["cookiefile"] = jar
+                headers = dict(out.get("http_headers") or {})
+                headers["User-Agent"] = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                )
+                out["http_headers"] = headers
 
     fmt = step.get("_format")
     if fmt:

@@ -54,7 +54,7 @@
       "required": false
     },
     "YT_COOKIES": {
-      "description": "Paste the raw contents of a cookies.txt exported from a browser logged into youtube.com (Netscape format). Base64 also accepted. Strongly recommended on Heroku to avoid bot-detection blocks.",
+      "description": "Optional. Raw cookies.txt from a browser logged into youtube.com (use a throwaway account). Only used as a fallback retry — a free Cloudflare WARP proxy is the primary fix.",
       "required": false
     },
     "YOUTUBE_API_KEY": {
@@ -90,6 +90,20 @@
       "description": "RSS (MB) above which the memory watchdog trims freed memory back to the OS. Leave empty to auto-derive ~80% of the dyno quota.",
       "required": false,
       "value": "820"
+    },
+    "USE_WARP": {
+      "description": "Route YouTube downloads through a free Cloudflare WARP proxy (fixes 'Sign in to confirm you're not a bot' on Heroku). Default true on cloud hosts.",
+      "value": "true",
+      "required": false
+    },
+    "YT_PROXY": {
+      "description": "Optional: your own proxy URL (http://user:pass@host:port or socks5://...). Overrides WARP.",
+      "required": false
+    },
+    "YT_COOKIES_MODE": {
+      "description": "fallback (default: cookies only on a retry), always, or off.",
+      "value": "fallback",
+      "required": false
     }
   },
   "formation": {

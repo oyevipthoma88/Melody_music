@@ -205,3 +205,22 @@ PY
     echo "       ⚠️ static ffmpeg download failed; falling back to the apt build (LD_LIBRARY_PATH repaired at boot)"
   fi
 fi
+
+
+# ── Cloudflare WARP (free clean egress IP for YouTube) ───────────────────
+# Heroku dyno IPs are bot-flagged by YouTube; melody/core/warp.py tunnels
+# yt-dlp through a free WARP identity using userspace wireproxy. Prefetch
+# the two static binaries into the slug so boot does not depend on GitHub.
+WARP_DIR="$BUILD_DIR/vendor/warp"
+mkdir -p "$WARP_DIR"
+echo "-----> Installing wgcf + wireproxy (Cloudflare WARP userspace proxy)"
+curl -fsSL --retry 5 --retry-all-errors \
+  "https://github.com/ViRb3/wgcf/releases/download/v2.3.0/wgcf_2.3.0_linux_amd64" \
+  -o "$WARP_DIR/wgcf" && chmod +x "$WARP_DIR/wgcf" \
+  || echo "       WARN wgcf download failed; the bot retries at startup"
+{ curl -fsSL --retry 5 --retry-all-errors \
+    "https://github.com/windtf/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz" \
+  || curl -fsSL --retry 5 --retry-all-errors \
+    "https://github.com/whyvl/wireproxy/releases/latest/download/wireproxy_linux_amd64.tar.gz"; } \
+  | tar -xz -C "$WARP_DIR" wireproxy && chmod +x "$WARP_DIR/wireproxy" \
+  || echo "       WARN wireproxy download failed; the bot retries at startup"

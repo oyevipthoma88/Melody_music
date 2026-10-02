@@ -119,15 +119,14 @@ def test_youtube_client_policy_keeps_cloud_direct_fallback_order():
     the cookiefile first.
     """
     source = _source("melody/core/ytdl.py")
-    assert '["web_safari", "web", "tv"] if has_cookies' in source
-    # Sep 30 2026 log: the cookie-less trio ios/visionos/web exposes no
-    # progressive audio-only format from a datacenter IP (only HLS 233/234 +
-    # muxed itag 18), so every direct resolve failed and /play paid a 10 MB
-    # download (stream=32.5s). android_vr needs no cookies and no PO token
-    # and still returns plain https itag 139/249/140/251, so it leads the
-    # anonymous list.
-    assert 'else ["android_vr", "ios", "visionos", "web"]' in source
-
+    # Oct 2 2026: the forced ["web_safari", "web", "tv"] cookie list was
+    # reproduced failing ("The page needs to be reloaded"); yt-dlp's own
+    # default clients succeed. Base opts must not hard-code a client list,
+    # and cookies are only attached by the dedicated "_cookies" ladder rung.
+    assert '["web_safari", "web", "tv"] if has_cookies' not in source
+    assert 'YT_PLAYER_CLIENTS' in source
+    assert '{"_cookies": True}' in source
+    assert 'if cookiefile and _cookies_mode() == "always":' in source
     assert '"player_client": ["android_music", "android_vr", "tv", "ios", "web_safari"]' not in source
     assert '"client": client_name' in source
     assert '"User-Agent": ua' in source

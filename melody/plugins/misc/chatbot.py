@@ -24,7 +24,7 @@ import time
 import asyncio
 
 from pyrogram import Client, enums, filters
-from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, LinkPreviewOptions, Message
 
 from melody import bot
 from melody.config import Config
@@ -517,7 +517,7 @@ async def chatbot_handler(client: Client, message: Message):
         await message.reply(
             response,
             parse_mode=enums.ParseMode.HTML,
-            disable_web_page_preview=True,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
     except Exception as exc:
         import logging
