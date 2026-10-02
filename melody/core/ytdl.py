@@ -1150,8 +1150,11 @@ def _cookie_key(line: str):
 
 def _absorb_cookie_writeback(path) -> None:
     global _COOKIE_TEXT, _COOKIE_ROTATED
-    if not path or not _COOKIE_TEXT or not str(path).startswith(_COOKIE_DIR):
+    if not path or not _JARS or not str(path).startswith(_COOKIE_DIR):
         return
+    jar_idx = _jar_index_from_path(path)
+    if jar_idx is None:
+        jar_idx = _ACTIVE_JAR
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
             text = f.read()
@@ -1174,7 +1177,7 @@ def _absorb_cookie_writeback(path) -> None:
         return
     with _COOKIE_LOCK:
         out, seen, changed = [], set(), 0
-        for line in _COOKIE_TEXT.splitlines():
+        for line in _JARS[jar_idx]["text"].splitlines():
             key = _cookie_key(line)
             if key in fresh:
                 seen.add(key)
@@ -1189,45 +1192,133 @@ def _absorb_cookie_writeback(path) -> None:
                 changed += 1
         if not changed:
             return
-        _COOKIE_TEXT = "\n".join(out).rstrip("\n") + "\n"
-        try:
-            _write_atomic(COOKIES_FILE, _COOKIE_TEXT)
-        except OSError:
-            pass
+        _JARS[jar_idx]["text"] = "\n".join(out).rstrip("\n") + "\n"
+        if jar_idx == _ACTIVE_JAR:
+            _COOKIE_TEXT = _JARS[jar_idx]["text"]
+            try:
+                _write_atomic(COOKIES_FILE, _COOKIE_TEXT)
+            except OSError:
+                pass
         _COOKIE_ROTATED += 1
         if _COOKIE_ROTATED == 1 or _COOKIE_ROTATED % 50 == 0:
             LOGGER.info("🍪 YouTube rotated %d cookie(s) — master jar updated (#%d)",
                         changed, _COOKIE_ROTATED)
 
 
-def cookiefile_for_run() -> "str | None":
-    """Fresh private copy of the cookie jar for one yt-dlp run (or None)."""
-    if not _COOKIE_TEXT:
+def cookiefile_for_run(jar: "int | None" = None) -> "str | None":
+    """Fresh private copy of one cookie jar for one yt-dlp run (or None).
+
+    `jar` picks a specific account; default is the first healthy one.
+    """
+    if not _JARS:
         return None
     with _COOKIE_LOCK:
+        if jar is None or not (0 <= jar < len(_JARS)):
+            order = _healthy_jar_order()
+            jar = order[0] if order else _ACTIVE_JAR
+        text = _JARS[jar]["text"]
         try:
             os.makedirs(_COOKIE_DIR, exist_ok=True)
             _reap_cookie_copies()
             path = os.path.join(
-                _COOKIE_DIR, f"c_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.txt"
+                _COOKIE_DIR, f"c{jar}_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.txt"
             )
-            _write_atomic(path, _COOKIE_TEXT)
+            _write_atomic(path, text)
             return path
         except OSError as exc:
             LOGGER.warning("cookie copy failed (%s) — falling back to master file", exc)
             return COOKIES_FILE if os.path.exists(COOKIES_FILE) else None
 
 
+# ── Multiple cookie accounts (YT_COOKIES, YT_COOKIES_2 … YT_COOKIES_10) ──────
+# ROOT-CAUSE FIX ("cookies added, still 152-18"): with ONE account, the moment
+# Google flags that session every cookie rung fails with 152-18 / bot-check
+# and there is nothing left to try. Each extra account is now its own jar:
+#   • the bot sticks to one healthy jar (a real browser doesn't hop accounts),
+#   • a jar answered with 152 / "not a bot" / reload-page is cooled down for
+#     YT_COOKIE_COOLDOWN seconds (default 1800) and the NEXT jar is tried on
+#     the very same rung, so one flagged account no longer kills the song,
+#   • rotated cookies are written back into the jar they came from.
+_JARS: list = []           # [{"name": str, "text": str, "bad_until": float}]
+_ACTIVE_JAR = 0
+_JAR_LABEL = "YT_COOKIES"
+_JAR_FILE_RE = re.compile(r"^c(\d+)_")
+
+
+def _cookie_cooldown() -> float:
+    try:
+        return max(60.0, float(os.getenv("YT_COOKIE_COOLDOWN", "1800")))
+    except ValueError:
+        return 1800.0
+
+
+def _set_active_jar(idx: int) -> None:
+    global _ACTIVE_JAR, _COOKIE_TEXT
+    if not _JARS:
+        return
+    _ACTIVE_JAR = idx % len(_JARS)
+    _COOKIE_TEXT = _JARS[_ACTIVE_JAR]["text"]
+    try:
+        _write_atomic(COOKIES_FILE, _COOKIE_TEXT)
+    except OSError:
+        pass
+
+
+def _healthy_jar_order() -> list:
+    """Jar indexes to try, active one first; cooled-down jars only if all are."""
+    if not _JARS:
+        return []
+    now = time.time()
+    n = len(_JARS)
+    order = [(_ACTIVE_JAR + i) % n for i in range(n)]
+    healthy = [i for i in order if _JARS[i]["bad_until"] <= now]
+    if healthy:
+        return healthy
+    return [min(order, key=lambda i: _JARS[i]["bad_until"])]
+
+
+def _jar_index_from_path(path) -> "int | None":
+    if not path:
+        return None
+    m = _JAR_FILE_RE.match(os.path.basename(str(path)))
+    if m:
+        idx = int(m.group(1))
+        return idx if idx < len(_JARS) else None
+    return _ACTIVE_JAR if str(path) == COOKIES_FILE and _JARS else None
+
+
+def mark_cookie_jar_blocked(path, reason: str = "") -> None:
+    """Cool down the account behind `path` and switch to the next healthy one."""
+    idx = _jar_index_from_path(path)
+    if idx is None:
+        return
+    with _COOKIE_LOCK:
+        jar = _JARS[idx]
+        already = jar["bad_until"] > time.time()
+        jar["bad_until"] = time.time() + _cookie_cooldown()
+        if len(_JARS) > 1 and idx == _ACTIVE_JAR:
+            nxt = _healthy_jar_order()
+            if nxt and nxt[0] != idx:
+                _set_active_jar(nxt[0])
+    if not already:
+        LOGGER.warning(
+            "🍪 %s flagged by YouTube (%s) — resting it %.0f min%s",
+            jar["name"], (reason or "blocked")[:80], _cookie_cooldown() / 60,
+            f", switching to {_JARS[_ACTIVE_JAR]['name']}" if len(_JARS) > 1 and _ACTIVE_JAR != idx else
+            " (add YT_COOKIES_2, YT_COOKIES_3 … for automatic failover)",
+        )
+
+
 def _store_cookies(text: str) -> None:
-    """Normalize once, keep in memory, and mirror to the master file."""
-    global _COOKIE_TEXT
-    _COOKIE_TEXT = _normalize_netscape(text)
-    _write_atomic(COOKIES_FILE, _COOKIE_TEXT)
+    """Normalize once, keep in memory as a new jar, mirror the active jar."""
+    _JARS.append({"name": _JAR_LABEL, "text": _normalize_netscape(text), "bad_until": 0.0})
+    if len(_JARS) == 1:
+        _set_active_jar(0)
 
 
 
-def _write_cookies():
-    """Load YT_COOKIES into COOKIES_FILE.
+def _write_cookies(raw_value: "str | None" = None):
+    """Load one YT_COOKIES* value as a cookie jar.
 
     ROOT-CAUSE FIX (previous bug):
     The old code ALWAYS ran base64.b64decode() first, even when YT_COOKIES
@@ -1243,14 +1334,12 @@ def _write_cookies():
     2. Only if that fails, attempt strict base64 decoding (validate=True so
        non-base64 text raises immediately instead of being silently corrupted).
     """
-    if not Config.YT_COOKIES:
-        LOGGER.warning(
-            "⚠️ YT_COOKIES is not set — bot will run WITHOUT a YouTube login. "
-            "Heroku IPs are heavily bot-checked; cookies are strongly recommended."
-        )
+    if raw_value is None:
+        raw_value = Config.YT_COOKIES
+    if not raw_value:
         return
 
-    raw = Config.YT_COOKIES.strip()
+    raw = raw_value.strip()
 
     # ── Path 1: already plain text (most common case) ──────────────────────
     if raw.startswith("["):
@@ -1303,10 +1392,31 @@ def _write_cookies():
     )
 
 
-_write_cookies()
+def _load_all_cookie_jars() -> None:
+    global _JAR_LABEL
+    names = ["YT_COOKIES"] + [f"YT_COOKIES_{i}" for i in range(2, 11)]
+    for name in names:
+        value = Config.YT_COOKIES if name == "YT_COOKIES" else os.getenv(name, "")
+        if not (value or "").strip():
+            continue
+        _JAR_LABEL = name
+        before = len(_JARS)
+        _write_cookies(value)
+        if len(_JARS) == before:
+            LOGGER.warning("🍪 %s could not be parsed — skipped", name)
+    _JAR_LABEL = "YT_COOKIES"
+    if not _JARS:
+        LOGGER.warning(
+            "⚠️ YT_COOKIES is not set — bot will run WITHOUT a YouTube login. "
+            "Heroku IPs are heavily bot-checked; cookies are strongly recommended."
+        )
+
+
+_load_all_cookie_jars()
 _HAS_COOKIES = bool(_COOKIE_TEXT)
 if _HAS_COOKIES:
-    LOGGER.info("🍪 Cookie-authenticated YouTube session ACTIVE — using logged-in requests")
+    LOGGER.info("🍪 Cookie-authenticated YouTube session ACTIVE — %d account(s): %s",
+                len(_JARS), ", ".join(j["name"] for j in _JARS))
 else:
     LOGGER.warning("🍪 No cookies loaded — running as anonymous guest (more likely to be blocked on Heroku)")
 
@@ -3051,7 +3161,10 @@ _DOWNLOAD_LADDER: tuple = (
                 "bestaudio[format_id=251]/bestaudio[format_id=250]/bestaudio[format_id=249]/"
                 "bestaudio[format_id=140]/bestaudio[protocol^=http]/bestaudio*[vcodec=none]/bestaudio/" + _SMALL_MUXED_SELECTOR,
      "concurrent_fragment_downloads": 1, "_no_merge": True},
-    {"_client": ["ios", "visionos", "web_embedded"],
+    # web_embedded removed: it answers "152 - 18" for any video whose
+    # uploader disabled embedding, and that misleading message became the
+    # final error shown for songs that are perfectly playable on YouTube.
+    {"_client": ["ios", "visionos", "mweb"],
      "_format": "bestaudio[ext=webm][protocol^=http]/bestaudio[ext=opus][protocol^=http]/"
                 "bestaudio[ext=ogg][protocol^=http]/bestaudio[ext=m4a][protocol*=dash]/"
                 "bestaudio[format_id=251]/bestaudio[format_id=140]/"
@@ -3103,7 +3216,7 @@ def _apply_ladder_step(opts: dict, step: dict, audio_only: bool) -> dict:
 
     if step.get("_cookies"):
         if _cookies_mode() != "off":
-            jar = cookiefile_for_run()
+            jar = cookiefile_for_run(step.get("_jar"))
             if jar:
                 out["cookiefile"] = jar
                 # ROOT-CAUSE FIX: one logged-in session seen from the dyno IP
@@ -3211,7 +3324,15 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
     # /play busy for minutes. Bound the whole ladder by wall clock so a
     # genuinely broken video fails fast instead of holding the chat hostage.
     deadline = _time_mod.monotonic() + _env_float("DOWNLOAD_DEADLINE", 45.0)
-    for index, step in enumerate(_DOWNLOAD_LADDER):
+    # Multiple cookie accounts: a cookie rung is tried once per healthy
+    # account, so one flagged account (152-18) falls through to the next.
+    ladder: list = []
+    for step in _DOWNLOAD_LADDER:
+        if step.get("_cookies") and len(_JARS) > 1:
+            ladder.extend({**step, "_jar": j} for j in _healthy_jar_order())
+        else:
+            ladder.append(step)
+    for index, step in enumerate(ladder):
         if index and _time_mod.monotonic() > deadline:
             LOGGER.warning("download ladder deadline hit for %s after %d attempts", url, index)
             break
@@ -3269,13 +3390,15 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
             _purge_partial_outputs(opts.get("outtmpl"))
             LOGGER.warning(
                 "download attempt %d/%d hit a missing temp file for %s; trying fallback",
-                index + 1, len(_DOWNLOAD_LADDER), url,
+                index + 1, len(ladder), url,
             )
             continue
         except _DownloadCancelled:
             raise
         except Exception as exc:  # noqa: BLE001 — every rung is a retry
             last_exc = exc
+            if step.get("_cookies") and opts.get("cookiefile") and _is_youtube_block_error(exc):
+                mark_cookie_jar_blocked(opts.get("cookiefile"), str(exc))
             if _is_permanent_download_error(exc):
                 _purge_partial_outputs(opts.get("outtmpl"))
                 LOGGER.info(
@@ -3289,7 +3412,7 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
             _purge_partial_outputs(opts.get("outtmpl"))
             LOGGER.warning(
                 "download attempt %d/%d failed for %s: %s",
-                index + 1, len(_DOWNLOAD_LADDER), url, redact_sensitive_text(exc),
+                index + 1, len(ladder), url, redact_sensitive_text(exc),
             )
     # ROOT-CAUSE FIX (Oct 2 2026 04:33 log): every rung failed with
     # "Sign in to confirm you're not a bot" / "152 - 18" / 403 — YouTube has

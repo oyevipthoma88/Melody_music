@@ -57,6 +57,27 @@
       "description": "Optional. Raw cookies.txt from a browser logged into youtube.com (use a throwaway account). Only used as a fallback retry — a free Cloudflare WARP proxy is the primary fix.",
       "required": false
     },
+    "YT_COOKIES_2": {
+      "description": "Optional. cookies.txt of another YouTube account (#2). If one account gets flagged (152-18 / not a bot) the bot rests it and switches automatically. Up to YT_COOKIES_10 supported.",
+      "required": false
+    },
+    "YT_COOKIES_3": {
+      "description": "Optional. cookies.txt of another YouTube account (#3). If one account gets flagged (152-18 / not a bot) the bot rests it and switches automatically. Up to YT_COOKIES_10 supported.",
+      "required": false
+    },
+    "YT_COOKIES_4": {
+      "description": "Optional. cookies.txt of another YouTube account (#4). If one account gets flagged (152-18 / not a bot) the bot rests it and switches automatically. Up to YT_COOKIES_10 supported.",
+      "required": false
+    },
+    "YT_COOKIES_5": {
+      "description": "Optional. cookies.txt of another YouTube account (#5). If one account gets flagged (152-18 / not a bot) the bot rests it and switches automatically. Up to YT_COOKIES_10 supported.",
+      "required": false
+    },
+    "YT_COOKIE_COOLDOWN": {
+      "description": "Seconds a flagged cookie account rests before reuse.",
+      "value": "1800",
+      "required": false
+    },
     "YOUTUBE_API_KEY": {
       "description": "YouTube Data API v3 key — makes song search/metadata resolve in ~0.3s instead of several seconds. Comma-separate multiple keys to auto-rotate on quota.",
       "required": false

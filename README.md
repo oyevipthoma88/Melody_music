@@ -167,6 +167,7 @@ The full configuration template is in [`.env.example`](.env.example). The follow
 | `LOG_GROUP_ID` | Yes | Private error/activity log group. |
 | `BOT_USERNAME` | Recommended | Bot username used in links and onboarding. |
 | `YT_COOKIES` | Strongly recommended for YouTube | Permitted YouTube cookie material in the supported configuration format. Keep it secret and rotate it. |
+| `YT_COOKIES_2` … `YT_COOKIES_10` | Optional | Cookies of additional YouTube accounts. A flagged account (152-18 / bot-check) is rested for `YT_COOKIE_COOLDOWN` seconds and the next one is used automatically. |
 | `BGUTIL_STARTUP_WARMUP` | Recommended | Warms the PO-token provider before first playback. |
 | `MAX_CONCURRENT_DOWNLOADS` | Recommended | Keep conservative on small hosts; `1` is a safe starting point. |
 | `PLAY_START_BUDGET` | Recommended | Strict playback source-start budget (default 4s, capped at 10s) so playback starts within ~5 seconds. |
