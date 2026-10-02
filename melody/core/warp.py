@@ -143,6 +143,31 @@ def _verify(proxy: str) -> str:
         return r.read().decode("utf-8", "replace")
 
 
+def _force_ipv4(profile: str) -> None:
+    """Keep only IPv4 inside the tunnel.
+
+    Oct 2 2026 log: WARP came up with an IPv6 egress (2a09:bac5:...) and
+    YouTube still bot-checked it. WARP's IPv6 /48s are shared by millions of
+    users and are flagged far more than its IPv4 pool. Dropping the v6
+    address/route makes every connection leave over IPv4.
+    WARP_IPV6=true restores dual-stack.
+    """
+    if _flag("WARP_IPV6", False):
+        return
+    out = []
+    for line in open(profile, encoding="utf-8").read().splitlines():
+        key = line.split("=", 1)[0].strip().lower()
+        if key in {"address", "allowedips", "dns"} and "=" in line:
+            vals = [v.strip() for v in line.split("=", 1)[1].split(",")]
+            vals = [v for v in vals if ":" not in v]
+            if not vals:
+                continue
+            line = f"{line.split('=', 1)[0].strip()} = {', '.join(vals)}"
+        out.append(line)
+    with open(profile, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+
+
 def _start_warp() -> str | None:
     global _proc
     wgcf, wireproxy = _ensure_binaries()
@@ -161,6 +186,8 @@ def _start_warp() -> str | None:
         cwd=work, check=True, timeout=60,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+
+    _force_ipv4(profile)
 
     conf = os.path.join(work, "wireproxy.conf")
     with open(conf, "w", encoding="utf-8") as f:

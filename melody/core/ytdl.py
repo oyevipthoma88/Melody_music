@@ -2927,6 +2927,9 @@ def is_download_in_progress(video_id: str, audio_only: bool = True) -> bool:
 # Each rung below changes exactly one thing, cheapest first.
 _DOWNLOAD_LADDER: tuple = (
     {},                                                        # yt-dlp default clients, no cookies
+    # Cookies from the DYNO IP (no VPN): a logged-in jar replayed through a
+    # shared WARP IP is what produced "Error code: 152 - 18".
+    {"_cookies": True, "_no_proxy": True},
     # Cookie rung sits at #3 on purpose: the ladder deadline usually allows
     # only ~3 attempts, and the old order never reached any rung that could
     # actually authenticate before giving up.
@@ -3014,6 +3017,9 @@ def _apply_ladder_step(opts: dict, step: dict, audio_only: bool) -> dict:
             # the web cookie jar, so let the client-specific identity win.
             out.pop("cookiefile", None)
 
+    if step.get("_no_proxy"):
+        out.pop("proxy", None)
+
     if step.get("_cookies"):
         if _cookies_mode() != "off":
             jar = cookiefile_for_run()
@@ -3078,6 +3084,20 @@ _PERMANENT_DOWNLOAD_MARKERS = (
 )
 
 
+# ROOT-CAUSE FIX (Oct 2 2026 04:19 log): "This video is unavailable. Error
+# code: 152 - 18" is NOT a removed video — it is what YouTube answers a
+# flagged session/IP (here: cookies replayed through a shared VPN IP). The
+# video played fine elsewhere, but the "this video is unavailable" marker
+# made the ladder stop and the user saw "removed/private". Bot-check style
+# answers are always retryable on another rung (different IP/identity).
+_RETRYABLE_BLOCK_MARKERS = (
+    "error code: 152",
+    "error code 152",
+    "sign in to confirm you",
+    "page needs to be reloaded",
+)
+
+
 def _is_permanent_download_error(exc: BaseException) -> bool:
     """Return True for content failures that no client/ladders can repair."""
     current: BaseException | None = exc
@@ -3085,6 +3105,8 @@ def _is_permanent_download_error(exc: BaseException) -> bool:
         if current is None:
             break
         text = str(current).lower()
+        if any(marker in text for marker in _RETRYABLE_BLOCK_MARKERS):
+            return False
         if any(marker in text for marker in _PERMANENT_DOWNLOAD_MARKERS):
             return True
         current = current.__cause__ or current.__context__

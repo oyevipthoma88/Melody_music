@@ -1201,7 +1201,6 @@ def _is_probe_error(exc: BaseException) -> bool:
 _UNAVAILABLE_MARKERS = (
     "video unavailable",
     "video is unavailable",
-    "error code 152",
     "removed by the uploader",
     "private video",
     "this video is not available",
@@ -1216,7 +1215,6 @@ _UNAVAILABLE_MARKERS = (
     "this content isn’t available",
     "members-only content",
     "this live event has ended",
-    "requested format is not available",
 )
 
 
@@ -1226,6 +1224,11 @@ def _is_unavailable_media_error(exc: BaseException) -> bool:
     seen = 0
     while cur is not None and seen < 8:
         text = str(cur).lower()
+        # 152-18 / bot-check = blocked session, not a removed video. Never
+        # tell the user "removed/private" for these (Oct 2 2026 log).
+        if ("error code: 152" in text or "error code 152" in text
+                or "sign in to confirm you" in text):
+            return False
         if any(marker in text for marker in _UNAVAILABLE_MARKERS):
             return True
         cur = cur.__cause__ or cur.__context__
