@@ -3317,22 +3317,59 @@ def _is_youtube_block_error(exc: BaseException) -> bool:
 
 
 def _youtube_title_for(url: str) -> str | None:
-    """oEmbed works even when the watch page is bot-blocked."""
-    try:
-        import json as _json
-        import urllib.parse as _up
-        import urllib.request as _ur
-        q = _up.urlencode({"url": url, "format": "json"})
-        with _ur.urlopen(f"https://www.youtube.com/oembed?{q}", timeout=6) as r:
-            data = _json.loads(r.read().decode("utf-8", "ignore"))
-        title = (data.get("title") or "").strip()
-        author = (data.get("author_name") or "").replace(" - Topic", "").strip()
-        if not title:
+    """Resolve a video's title for the SoundCloud fallback.
+
+    oEmbed works even when the watch page is bot-blocked, but it returns
+    401/404 for videos YouTube marks unavailable (error 152-18) — exactly the
+    case this fallback exists for. So try oEmbed first, then noembed, then
+    the Innertube player endpoint, which still returns playability metadata
+    (including the title) for unavailable videos.
+    """
+    import json as _json
+    import urllib.parse as _up
+    import urllib.request as _ur
+
+    def _from_oembed(endpoint: str) -> "str | None":
+        try:
+            q = _up.urlencode({"url": url, "format": "json"})
+            with _ur.urlopen(f"{endpoint}?{q}", timeout=6) as r:
+                data = _json.loads(r.read().decode("utf-8", "ignore"))
+            title = (data.get("title") or "").strip()
+            author = (data.get("author_name") or "").replace(" - Topic", "").strip()
+            if not title:
+                return None
+            return title if author.lower() in title.lower() else f"{title} {author}".strip()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("title lookup via %s failed for %s: %s", endpoint, url, exc)
             return None
-        return title if author.lower() in title.lower() else f"{title} {author}".strip()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.debug("oEmbed title lookup failed for %s: %s", url, exc)
-        return None
+
+    title = _from_oembed("https://www.youtube.com/oembed")
+    if title:
+        return title
+    title = _from_oembed("https://noembed.com/embed")
+    if title:
+        return title
+
+    vid = None
+    try:
+        parsed = _up.urlparse(url)
+        if "youtu.be" in parsed.netloc:
+            vid = parsed.path.lstrip("/").split("/")[0]
+        else:
+            vid = _up.parse_qs(parsed.query).get("v", [None])[0]
+    except Exception:  # noqa: BLE001
+        vid = None
+    if vid and is_valid_video_id(vid):
+        try:
+            info = _innertube_player_sync(vid)
+            if info:
+                t = (info.get("title") or "").strip()
+                a = (info.get("author") or info.get("uploader") or "").replace(" - Topic", "").strip()
+                if t:
+                    return t if not a or a.lower() in t.lower() else f"{t} {a}".strip()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("innertube title lookup failed for %s: %s", vid, exc)
+    return None
 
 
 def _alt_source_download(url: str, base_opts: dict):
