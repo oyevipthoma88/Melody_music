@@ -3295,6 +3295,10 @@ _RETRYABLE_BLOCK_MARKERS = (
     "error code 152",
     "sign in to confirm you",
     "page needs to be reloaded",
+    # Oct 2 2026 10:31 log: with the dyno IP + every cookie jar flagged,
+    # YouTube answers some clients with an empty player response. yt-dlp
+    # reports that as "Failed to extract any player response" — same block.
+    "failed to extract any player response",
 )
 
 
@@ -3320,6 +3324,7 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
     failed, so callers still see a real traceback for genuinely dead videos.
     """
     last_exc: BaseException | None = None
+    saw_block = False
     # SPEED FIX: 8 rungs x (retries x socket_timeout) could keep a single
     # /play busy for minutes. Bound the whole ladder by wall clock so a
     # genuinely broken video fails fast instead of holding the chat hostage.
@@ -3397,6 +3402,8 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
             raise
         except Exception as exc:  # noqa: BLE001 — every rung is a retry
             last_exc = exc
+            if _is_youtube_block_error(exc):
+                saw_block = True
             if step.get("_cookies") and opts.get("cookiefile") and _is_youtube_block_error(exc):
                 mark_cookie_jar_blocked(opts.get("cookiefile"), str(exc))
             if _is_permanent_download_error(exc):
@@ -3420,7 +3427,7 @@ def _extract_with_retries(url: str, base_opts: dict, audio_only: bool):
     # and the song died after ~30s. For audio requests, fall back to the same
     # song on SoundCloud (different host, not blocked). Video requests stay
     # YouTube-only so /vplay never silently becomes audio.
-    if audio_only and last_exc is not None and _is_youtube_block_error(last_exc):
+    if audio_only and last_exc is not None and (saw_block or _is_youtube_block_error(last_exc)):
         alt = _alt_source_download(url, base_opts)
         if alt is not None:
             return alt
