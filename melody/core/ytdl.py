@@ -278,8 +278,12 @@ def _locked_ytdl(opts: dict):
     with _YTDLP_INIT_LOCK:
         ydl = YoutubeDL(opts)
     # Keep yt-dlp's own console-title/cookie/request-director cleanup intact.
-    with ydl as active:
-        yield active
+    try:
+        with ydl as active:
+            yield active
+    finally:
+        # yt-dlp writes YouTube's rotated cookies back on close; keep them.
+        _absorb_cookie_writeback(opts.get("cookiefile"))
 
 
 # ── Warm, reusable YoutubeDL for metadata/URL resolves ──────────────────────
@@ -1120,6 +1124,82 @@ def _reap_cookie_copies() -> None:
         pass
 
 
+# ROOT-CAUSE FIX ("cookies added but still 'not a bot' / 152 - 18"):
+# YouTube rotates __Secure-*PSIDTS / SIDCC on every logged-in request and
+# yt-dlp writes the rotated values back into `cookiefile` when it closes.
+# Every run got a throwaway copy that was deleted afterwards, so the master
+# jar stayed frozen at the ORIGINAL values. Replaying stale, already-rotated
+# cookies is exactly what makes Google mark the session as hijacked — after
+# the first few songs every cookie request was answered with 152-18 or the
+# bot check. The write-back is now merged (per cookie, under a lock) into the
+# in-memory master so the session keeps rotating like a real browser.
+_COOKIE_ROTATED = 0
+
+
+def _cookie_key(line: str):
+    parts = line.split("\t")
+    if len(parts) < 7:
+        return None
+    domain = parts[0]
+    if domain.startswith("#HttpOnly_"):
+        domain = domain[len("#HttpOnly_"):]
+    elif domain.startswith("#"):
+        return None
+    return (domain.lstrip("."), parts[2], parts[5])
+
+
+def _absorb_cookie_writeback(path) -> None:
+    global _COOKIE_TEXT, _COOKIE_ROTATED
+    if not path or not _COOKIE_TEXT or not str(path).startswith(_COOKIE_DIR):
+        return
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+    except OSError:
+        return
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    first = text.lstrip().splitlines()[0] if text.strip() else ""
+    if "Netscape HTTP Cookie File" not in first:
+        return
+    fresh = {}
+    for line in text.splitlines():
+        key = _cookie_key(line)
+        if key and ("youtube" in key[0] or "google" in key[0]):
+            fresh[key] = line
+    if not fresh:
+        return
+    with _COOKIE_LOCK:
+        out, seen, changed = [], set(), 0
+        for line in _COOKIE_TEXT.splitlines():
+            key = _cookie_key(line)
+            if key in fresh:
+                seen.add(key)
+                if fresh[key] != line:
+                    changed += 1
+                out.append(fresh[key])
+            else:
+                out.append(line)
+        for key, line in fresh.items():
+            if key not in seen:
+                out.append(line)
+                changed += 1
+        if not changed:
+            return
+        _COOKIE_TEXT = "\n".join(out).rstrip("\n") + "\n"
+        try:
+            _write_atomic(COOKIES_FILE, _COOKIE_TEXT)
+        except OSError:
+            pass
+        _COOKIE_ROTATED += 1
+        if _COOKIE_ROTATED == 1 or _COOKIE_ROTATED % 50 == 0:
+            LOGGER.info("🍪 YouTube rotated %d cookie(s) — master jar updated (#%d)",
+                        changed, _COOKIE_ROTATED)
+
+
 def cookiefile_for_run() -> "str | None":
     """Fresh private copy of the cookie jar for one yt-dlp run (or None)."""
     if not _COOKIE_TEXT:
@@ -1578,7 +1658,8 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         opts["cookiefile"] = cookiefile
 
     proxy = _warp.get_proxy()
-    if proxy:
+    if proxy and not (opts.get("cookiefile") and os.getenv("COOKIES_VIA_PROXY", "0").lower()
+                      not in ("1", "true", "yes")):
         opts["proxy"] = proxy
 
     return opts
@@ -3025,6 +3106,12 @@ def _apply_ladder_step(opts: dict, step: dict, audio_only: bool) -> dict:
             jar = cookiefile_for_run()
             if jar:
                 out["cookiefile"] = jar
+                # ROOT-CAUSE FIX: one logged-in session seen from the dyno IP
+                # on one rung and the shared WARP IP on the next looks like a
+                # stolen session to Google (-> 152-18). Cookies always travel
+                # from the same IP the bot was started on.
+                if os.getenv("COOKIES_VIA_PROXY", "0").lower() not in ("1", "true", "yes"):
+                    out.pop("proxy", None)
                 headers = dict(out.get("http_headers") or {})
                 headers["User-Agent"] = (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
