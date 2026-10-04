@@ -1615,6 +1615,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # attached), so hard-coding a client list is what kept breaking.
         # YT_PLAYER_CLIENTS="a,b,c" remains as a manual override.
         "formats": ["missing_pot"],
+        "player_js_version": "actual",
         # SPEED FIX: the watch-page "configs" request and translated-subtitle
         # listing are never used by playback but cost a round-trip each.
         # NOTE: "webpage" must NOT be skipped — the web client needs the
