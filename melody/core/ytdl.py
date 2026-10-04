@@ -1741,6 +1741,7 @@ def _ydl_opts(audio_only: bool = True) -> dict:
         # broken instead of falling back to whatever is on PATH.
         "remote_components": ["ejs:github"],
 
+        "source_address": "0.0.0.0",
         "extractor_args": provider_args,
         # Merging only kicks in for the bestvideo+bestaudio fallback above;
         # it guarantees ONE file with both tracks instead of two siblings.
