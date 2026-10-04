@@ -4731,7 +4731,36 @@ async def _download_audio_locked(
     # prefix; cache/persistence callers can therefore never receive a partial.
     await done_async.wait()
     if "error" in early_holder:
-        raise early_holder["error"]
+        _orig_err = early_holder["error"]
+        _err_lc = str(_orig_err).lower()
+        # === JIOSAAVN/PIPED RESCUE ===
+        if any(x in _err_lc for x in (
+            "sign in to confirm", "403", "forbidden",
+            "not a bot", "unavailable", "requested format",
+        )):
+            try:
+                from melody.core.jiosaavn_fallback import try_alt_sources as _try_alt
+                _alt_url = await _try_alt(video_id, video_id, None)
+                if _alt_url:
+                    LOGGER.info(f"⚡ JioSaavn/Piped rescue for {video_id}: {_alt_url[:60]}")
+                    import tempfile as _tf
+                    _tmpdir = _tf.mkdtemp(prefix="melody-rescue-")
+                    def _rescue_sync():
+                        _ropts = dict(_ydl_opts(audio_only=audio_only))
+                        _ropts["outtmpl"] = os.path.join(_tmpdir, "%(id)s.%(ext)s")
+                        _ropts.pop("progress_hooks", None)
+                        with YoutubeDL(_ropts) as _rydl:
+                            _rinfo = _rydl.extract_info(_alt_url, download=True)
+                            _rpath = _rydl.prepare_filename(_rinfo)
+                        return _rinfo, _rpath
+                    _rinfo, _rpath = await loop.run_in_executor(YTDL_POOL, _rescue_sync)
+                    if _rpath and os.path.exists(_rpath):
+                        LOGGER.info(f"✅ Rescued via JioSaavn/Piped: {_rpath}")
+                        return _rpath
+            except Exception as _alt_e:
+                LOGGER.warning(f"Alt rescue failed for {video_id}: {_alt_e}")
+        # ==============================
+        raise _orig_err
     path = early_holder.get("final_path")
     if path and os.path.exists(path) and not path.endswith(".part"):
         return path
