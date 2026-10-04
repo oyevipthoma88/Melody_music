@@ -4760,6 +4760,15 @@ async def _download_audio_locked(
             except Exception as _alt_e:
                 LOGGER.warning(f"Alt rescue failed for {video_id}: {_alt_e}")
         # ==============================
+        # WARP_AUTO_ROTATE: 403 detection → rotate WARP identity
+        try:
+            _el = str(locals().get("early_holder", {}).get("error", "") or "").lower()
+            if "403" in _el or "forbidden" in _el:
+                LOGGER.warning("YT 403 → rotating WARP IP")
+                from melody.core import warp as _wrp
+                _wrp.force_refresh()
+        except Exception:
+            pass
         raise _orig_err
     path = early_holder.get("final_path")
     if path and os.path.exists(path) and not path.endswith(".part"):

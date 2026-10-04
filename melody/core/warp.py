@@ -272,5 +272,29 @@ def get_proxy(wait: float = 0.0) -> str | None:
     return _proxy_url
 
 
+def force_refresh() -> None:
+    """Delete wgcf identity + restart WARP — gets a NEW Cloudflare IP."""
+    global _proxy_url, _proc, _started
+    with _lock:
+        try:
+            if _proc and _proc.poll() is None:
+                _proc.kill()
+        except Exception:
+            pass
+        try:
+            os.remove(os.path.join(_RUNTIME_DIR, "wgcf-account.toml"))
+        except OSError:
+            pass
+        try:
+            os.remove(os.path.join(_RUNTIME_DIR, "wgcf-profile.conf"))
+        except OSError:
+            pass
+        _proxy_url = None
+        _ready.clear()
+        _started = False
+    LOGGER.warning("🔄 WARP identity reset — will re-register on next start")
+    start_in_background()
+
+
 def is_ready() -> bool:
     return _ready.is_set()
