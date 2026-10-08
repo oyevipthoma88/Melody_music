@@ -195,7 +195,7 @@ def start_monitor() -> None:
     _monitor_task = asyncio.get_running_loop().create_task(_loop())
 
 
-async def download(
+async def _download_file(
     video_id: str, tag: str, audio_only: bool = True,
     cancel_event: "threading.Event | None" = None,
 ) -> Optional[str]:
@@ -268,3 +268,48 @@ def _rm(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _stream_after() -> float:
+    try:
+        return max(3.0, float(os.environ.get("SHRUTI_STREAM_AFTER", "10")))
+    except ValueError:
+        return 10.0
+
+
+def stream_url(video_id: str, audio_only: bool = True) -> Optional[str]:
+    """Direct API URL that ffmpeg can play while the API is still sending."""
+    keys = _live_keys()
+    if not keys:
+        return None
+    kind = "audio" if audio_only else "video"
+    return f"{_base()}/stream/{video_id}?type={kind}&api_key={keys[0]}"
+
+
+async def download(
+    video_id: str, tag: str, audio_only: bool = True,
+    cancel_event: "threading.Event | None" = None,
+) -> Optional[str]:
+    """ROOT FIX ("No playable source" on long kathas / 1-2 hr videos):
+    a full download of a long track cannot finish inside the play budget, the
+    API attempt timed out, yt-dlp is blocked on Heroku -> nothing to play.
+    Now: wait SHRUTI_STREAM_AFTER s (default 10) for the file; if it is still
+    downloading, hand ffmpeg the API URL so playback starts immediately."""
+    task = asyncio.ensure_future(_download_file(video_id, tag, audio_only=audio_only,
+                                                cancel_event=cancel_event))
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=_stream_after())
+    except asyncio.TimeoutError:
+        pass
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+    task.cancel()
+    url = stream_url(video_id, audio_only)
+    if url:
+        STATUS["ok"] += 1
+        STATUS["last_ok"] = time.time()
+        LOGGER.info("⚡ ShrutiAPI %s %s is long/slow (>%.0fs) — streaming directly from API URL",
+                    "audio" if audio_only else "video", video_id, _stream_after())
+    return url
+

@@ -118,3 +118,6 @@ if _shruti_on():
             _time.sleep(0.02)
 
     _th.Thread(target=_watch, name="shruti-patch", daemon=True).start()
+
+
+from melody import _rootfix as _rf  # noqa: E402,F401  (song-end stuck-loop fix)
