@@ -17,7 +17,7 @@ from utils.decorators import admin_or_auth, error_handler
 from utils.formatters import send_quote, format_duration
 
 
-@bot.on_message(filters.command(["queue", "q"]) & filters.group)
+@bot.on_message(filters.command(["queue", "que", "qu"]) & filters.group)
 @error_handler
 async def queue_cmd(client: Client, message: Message):
     # format_queue() already wraps its own <blockquote> — send as-is.

@@ -8,7 +8,7 @@ FROM nikolaik/python-nodejs:python3.10-nodejs18
 
 # Install system dependencies
 RUN apt-get update -y && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends fonts-noto-core fonts-noto-color-emoji \
         ffmpeg \
         git \
         wget \

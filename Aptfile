@@ -1,3 +1,5 @@
 libcairo2
 libpango-1.0-0
 libgdk-pixbuf-2.0-0
+fonts-noto-core
+fonts-noto-color-emoji

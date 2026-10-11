@@ -58,7 +58,7 @@ HELP_PAGES = {
     ),
     "queue": (
         f"{headline('Queue')}\n\n"
-        "<code>/queue</code> <code>/q</code> — 📋 Queue dekho\n"
+        "<code>/queue</code> <code>/que</code> — 📋 Queue dekho\n"
         "<code>/skip</code> <code>/s</code> <code>/next</code> — ⏭ Agla gaana\n"
         "<code>/skip [pos]</code> — ⏭ Seedha queue position pe jao\n"
         "<code>/remove [pos]</code> — ❌ Ek item hatao\n"
@@ -336,6 +336,9 @@ HELP_PAGES = {
         "🔸 <code>/play</code> · <code>/vplay</code> · <code>/playforce</code>\n"
         "🔸 <code>/queue</code> · <code>/skip</code> · <code>/pause</code> · <code>/resume</code> · <code>/stop</code>\n"
         "🔸 <code>/loop</code> · <code>/seek 30</code> · <code>/volume 120</code> · <code>/speed 1.5</code>\n\n"
+        "<b>💬 Quote &amp; Sticker</b>\n"
+        "🔸 <code>/q</code> · <code>/q 3</code> · <code>/q r</code> — reply karke chat ka screenshot sticker\n"
+        "🔸 <code>/kang [emoji]</code> — sticker/photo apne pack me (pehle bot DM me /start)\n\n"
         "<b>3️⃣ Channel me music</b>\n"
         "🔸 <code>/channelplay @channel</code> → <code>/cplay song</code>\n\n"
         "<b>4️⃣ Group manage</b>\n"
