@@ -835,5 +835,18 @@ async def main():
 
 
 if __name__ == "__main__":
+    # BUG FIX ("[Errno 24] Too many open files"): VPS default soft limit is
+    # 1024 fds. yt-dlp, ffmpeg, ntgcalls and Pyrogram sockets easily exceed it
+    # with a few active voice chats. Raise the soft limit to the hard limit.
+    try:
+        import resource as _res
+        _soft, _hard = _res.getrlimit(_res.RLIMIT_NOFILE)
+        _target = _hard if _hard != _res.RLIM_INFINITY else 1048576
+        _target = min(_target, 1048576)
+        if _soft < _target:
+            _res.setrlimit(_res.RLIMIT_NOFILE, (_target, _hard))
+        LOGGER.info("open-files limit: %s", _res.getrlimit(_res.RLIMIT_NOFILE)[0])
+    except Exception as _exc:  # noqa: BLE001
+        LOGGER.warning("could not raise open-files limit: %s", _exc)
     uvloop.install()
     asyncio.run(main())

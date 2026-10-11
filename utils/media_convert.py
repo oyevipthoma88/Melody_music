@@ -68,10 +68,14 @@ async def _run(*args: str, timeout: int = _CONVERT_TIMEOUT) -> "tuple[int, bytes
     )
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
+    except BaseException:
         try:
             proc.kill()
         except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3)
+        except BaseException:  # noqa: BLE001
             pass
         raise
     return proc.returncode or 0, out or b""

@@ -338,6 +338,12 @@ def _warm_extract(opts: dict, target: str, cache_key: str = "resolve"):
             with _WARM_YDL_LOCK:
                 if _WARM_YDL.get(cache_key) is entry:
                     _WARM_YDL.pop(cache_key, None)
+            # BUG FIX (fd leak -> "Too many open files"): the dropped instance
+            # was never closed, leaking its HTTP sockets + cookie file handles.
+            try:
+                entry["ydl"].close()
+            except Exception:  # noqa: BLE001
+                pass
             raise
         finally:
             entry["lock"].release()

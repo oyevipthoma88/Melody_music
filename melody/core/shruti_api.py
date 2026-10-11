@@ -75,7 +75,7 @@ def _get_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            timeout=httpx.Timeout(_timeout(), connect=8.0),
+            timeout=httpx.Timeout(_timeout(), connect=5.0),
             follow_redirects=True,
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
@@ -272,9 +272,9 @@ def _rm(path: str) -> None:
 
 def _stream_after() -> float:
     try:
-        return max(3.0, float(os.environ.get("SHRUTI_STREAM_AFTER", "10")))
+        return max(1.5, float(os.environ.get("SHRUTI_STREAM_AFTER", "3")))
     except ValueError:
-        return 10.0
+        return 3.0
 
 
 def stream_url(video_id: str, audio_only: bool = True) -> Optional[str]:

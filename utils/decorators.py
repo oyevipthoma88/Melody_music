@@ -416,6 +416,14 @@ def error_handler(func):
                 # Retry itself failed (likely flooded again) — give up quietly.
                 # No user-facing message and no error-log spam for flood control.
                 pass
+        except (TimeoutError, asyncio.TimeoutError, ConnectionError) as e:
+            # BUG FIX ("Error in start_group: Failed to invoke
+            # messages.SendMessage after 10 retries"): a transient Telegram
+            # network timeout is not a code crash. Replying would hit the same
+            # dead connection again, and posting a crash card to the log group
+            # spams the owner. Log a warning and move on.
+            LOGGER.warning("Transient network timeout in %s: %s", func.__name__, e)
+            return None
         except Exception as e:
             # Build structured context from the update so the log channel
             # shows which command, which chat, and which user triggered

@@ -105,6 +105,10 @@ async def _supported_flags(binary: str) -> "set[str] | None":
                 proc.kill()
             except Exception:
                 pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except BaseException:  # noqa: BLE001
+                pass
     except FileNotFoundError:
         raise
     except Exception as exc:
@@ -340,9 +344,22 @@ async def probe_audio_streams(url: str, headers: "dict | None" = None) -> "bool 
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(), timeout=PROBE_TIMEOUT_REMOTE
-        )
+        try:
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(), timeout=PROBE_TIMEOUT_REMOTE
+            )
+        except BaseException:
+            # BUG FIX (fd/zombie leak): a timed-out ffprobe kept running with
+            # its pipes open. Kill and reap it.
+            try:
+                process.kill()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await asyncio.wait_for(process.wait(), timeout=3)
+            except BaseException:  # noqa: BLE001
+                pass
+            raise
     except Exception:  # noqa: BLE001 - probe is advisory only
         return None
     try:
