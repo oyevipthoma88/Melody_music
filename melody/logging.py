@@ -144,6 +144,11 @@ async def send_error_log(
     html.escape() ensures angle brackets, ampersands, etc. don't
     break the HTML entity parser either.
     """
+    # Keep expected Telegram chat/user problems local to the affected chat.
+    # Check before importing the bot or constructing a card/owner mention.
+    if is_expected_chat_problem(exc, text):
+        LOGGER.debug("Suppressed expected chat/user error: %s", redact_sensitive_text(exc or text))
+        return
     try:
         from melody import bot
         safe_text = html.escape(redact_sensitive_text(text))
@@ -255,3 +260,42 @@ async def send_error_log(
         LOGGER.error("Failed to send log to group: %s", redact_sensitive_text(text), exc_info=delivery_exc)
         if exc:
             LOGGER.error("Original error that failed to deliver: %s", redact_sensitive_text(exc), exc_info=exc)
+
+
+def is_expected_chat_problem(exc: BaseException | None, text: str = "") -> bool:
+    """Recognize explicit Telegram access/state errors, including wrapped causes.
+
+    Do not match generic 'forbidden', 'permission', or 'muted': those also
+    appear in real filesystem/API failures and mute-command error labels.
+    """
+    markers = {
+        "CHATWRITEFORBIDDEN", "CHATSENDPLAINFORBIDDEN", "CHATADMINREQUIRED",
+        "CHATSENDPHOTOSFORBIDDEN", "CHATSENDVIDEOSFORBIDDEN",
+        "CHATSENDAUDIOSFORBIDDEN", "CHATSENDMEDIAFORBIDDEN",
+        "CHATSENDDOCSFORBIDDEN", "CHATSENDVOICESFORBIDDEN",
+        "CHATSENDSTICKERSFORBIDDEN", "CHATSENDGIFSFORBIDDEN",
+        "CHATFORBIDDEN", "CHANNELPRIVATE", "CHANNELINVALID", "PEERIDINVALID",
+        "USERBANNEDINCHANNEL", "USERKICKED", "USERBLOCKED", "USERISBLOCKED",
+        "BOTBLOCKED", "USERNOTPARTICIPANT", "USERALREADYPARTICIPANTBANNED",
+        "INVITEHASHEXPIRED", "INVITEHASHINVALID", "INVITEREQUESTSENT",
+        "NOACTIVEGROUPCALL", "GROUPCALLINVALID", "GROUPCALLNOTFOUND",
+        "GROUPCALLFORBIDDEN", "GROUPCALLFULL", "PARTICIPANTJOINMISSING",
+        "JOINASPEERINVALID", "NOTINCALLERROR", "SLOWMODEWAIT",
+        "MESSAGENOTMODIFIED", "MESSAGEIDINVALID", "MESSAGEDELETEFORBIDDEN",
+        "QUERYIDINVALID", "USERNAMENOTOCCUPIED", "USERNAMEINVALID",
+    }
+    def matches(value):
+        # Token boundaries prevent accidental substring matches in bug labels.
+        tokens = re.findall(r"[A-Za-z][A-Za-z_]*", str(value))
+        if any(token.replace("_", "").upper() in markers for token in tokens):
+            return True
+        return "no active group call" in str(value).lower()
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if matches(type(current).__name__) or matches(current):
+            return True
+        current = current.__cause__ or current.__context__
+    # When an exception is present, inspect it, not an unrelated command label.
+    return matches(text) if exc is None else False
