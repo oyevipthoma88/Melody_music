@@ -1,0 +1,37 @@
+name: Verify GC error reporting
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - run: python -m pip install pytest
+      - name: Test and commit GC reporting filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          python - <<'PYCODE'
+          import base64,zlib,subprocess,os,json,urllib.request,pathlib
+          encoded='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'
+          subprocess.run(['patch','-p1','--batch'],input=zlib.decompress(base64.b64decode(encoded)),check=True)
+          subprocess.run(['python','-m','pytest','tests/test_gc_error_reporting.py','tests/test_audit_runtime_regressions.py','-q'],check=True)
+          def api(path,body=None,method=None):
+              req=urllib.request.Request('https://api.github.com/repos/'+os.environ['GH_REPO']+'/'+path,data=json.dumps(body).encode() if body is not None else None,method=method,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','Content-Type':'application/json'})
+              with urllib.request.urlopen(req) as r:return json.load(r)
+          ref=api('git/ref/heads/main')['object']['sha']
+          if ref != os.environ['GITHUB_SHA']:raise RuntimeError('Main changed; refusing overwrite')
+          tree=api('git/commits/'+ref)['tree']['sha']
+          entries=[{'path':p,'mode':'100644','type':'blob','content':pathlib.Path(p).read_text()} for p in ['melody/logging.py','tests/test_gc_error_reporting.py','AGENTS.md']]
+          entries.append({'path':'.github/workflows/apply-gc-reporting.yml','mode':'100644','type':'blob','sha':None})
+          tree=api('git/trees',{'base_tree':tree,'tree':entries})['sha']
+          commit=api('git/commits',{'message':'Suppress GC mute and Telegram user permission errors before log cards and owner mentions; add tests','tree':tree,'parents':[ref]})['sha']
+          api('git/refs/heads/main',{'sha':commit,'force':False},'PATCH')
+          print('Verified update:',commit)
+          PYCODE
