@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 _SETTINGS_TTL = 45.0
 _settings_cache: dict[tuple[int, str], tuple[float, object]] = {}
+_MISSING_SETTING = object()
 # Atlas blocks every write after the free/shared cluster reaches its storage
 # quota. Persistence is helpful but never a prerequisite for playback; stop
 # retrying after the first confirmed quota rejection so autoplay/background
@@ -240,18 +241,16 @@ async def get_setting(chat_id: int, key: str, default=None):
     cached = _settings_cache.get(cache_key)
     now = time.monotonic()
     if cached and cached[0] > now:
-        return cached[1]
+        return default if cached[1] is _MISSING_SETTING else cached[1]
     doc = await settings_col.find_one({"chat_id": chat_id})
-    value = doc.get(key, default) if doc else default
+    value = doc.get(key, _MISSING_SETTING) if doc else _MISSING_SETTING
     _settings_cache[cache_key] = (now + _SETTINGS_TTL, value)
-    return value
+    return default if value is _MISSING_SETTING else value
 
 
 async def set_setting(chat_id: int, key: str, value):
     if _STORAGE_WRITES_DISABLED:
-        # Keep the process-local value useful even while Atlas is full.
-        _settings_cache[(int(chat_id), str(key))] = (time.monotonic() + _SETTINGS_TTL, value)
-        return
+        raise RuntimeError("Setting not saved: MongoDB storage quota is full.")
     try:
         await settings_col.update_one(
             {"chat_id": chat_id},
@@ -261,8 +260,8 @@ async def set_setting(chat_id: int, key: str, value):
     except Exception as exc:
         if _is_storage_quota_error(exc):
             _disable_storage_writes(exc)
-        else:
-            raise
+            raise RuntimeError("Setting not saved: MongoDB storage quota is full.") from exc
+        raise
     _settings_cache[(int(chat_id), str(key))] = (time.monotonic() + _SETTINGS_TTL, value)
 
 

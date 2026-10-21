@@ -12,14 +12,14 @@ Every command handler (they all go through ``error_handler``) is wrapped by
 :func:`guard`:
 
 1. **Instant response.** The moment a command arrives, the user gets feedback
-   within milliseconds — a reaction on their message (fire-and-forget task, so
+   only when COMMAND_REACTIONS is explicitly enabled — a reaction (fire-and-forget task, so
    it never delays the real work). Nothing else in the pipeline can make the
    user wait before seeing that the bot heard them.
 
 2. **Strict lock.** The same command in the same chat cannot run twice at the
    same time. Spam-tapping ``/skip`` five times used to start five skips (five
    race conditions in the queue). Now the first one runs and the rest are
-   silently dropped (only the 👍 reaction, no chat spam such as "already chal
+   silently dropped (optional acknowledgement, no chat spam such as "already chal
    raha hai"), so playback state can never be corrupted by double execution.
 
 3. **Cooldown.** After a command finishes, the exact same command from the same
@@ -32,6 +32,8 @@ and adds no latency.
 from __future__ import annotations
 
 import time
+import itertools
+import os
 from utils.tasks import spawn
 
 # (chat_id, command) → started_at  — currently running commands
@@ -39,7 +41,7 @@ _inflight: "dict[tuple[int, str], float]" = {}
 # (chat_id, user_id, command) → finished_at — anti double-tap
 _recent: "dict[tuple[int, int, str], float]" = {}
 # (chat_id, message_id) → seen_at — the ONE message that already took the lock
-_seen_messages: "dict[tuple[int, int], float]" = {}
+_seen_messages: "dict[tuple, float]" = {}
 
 # A command can never hold the lock longer than this (safety valve against a
 # handler that dies without releasing, e.g. hard network hang).
@@ -47,6 +49,8 @@ MAX_HOLD = 90.0
 COOLDOWN = 0.8
 
 _ACK_EMOJI = "👍"
+_tokens = itertools.count(1)
+_owners: dict[tuple[int, str], int] = {}
 
 
 def _cmd_name(update) -> "str | None":
@@ -61,6 +65,7 @@ def _prune(now: float) -> None:
     for key, ts in list(_inflight.items()):
         if now - ts > MAX_HOLD:
             _inflight.pop(key, None)
+            _owners.pop(key, None)
     for key, ts in list(_recent.items()):
         if now - ts > 30:
             _recent.pop(key, None)
@@ -70,7 +75,10 @@ def _prune(now: float) -> None:
 
 
 def instant_ack(update) -> None:
-    """Give the user feedback immediately, without blocking the handler."""
+    """Optional acknowledgement; disabled before creating any background task."""
+    raw = (os.getenv("COMMAND_REACTIONS") or "").strip().strip("\"'").lower()
+    if raw not in {"1", "true", "yes", "on", "y"}:
+        return
     try:
         react = getattr(update, "react", None)
         if react is None:
@@ -87,7 +95,7 @@ def instant_ack(update) -> None:
         pass
 
 
-async def acquire(update) -> "tuple[bool, str | None]":
+async def acquire(update, *, handler: str = "") -> "tuple[bool, str | None]":
     """Try to take the lock for this command.
 
     Returns ``(allowed, key)``. When ``allowed`` is False the caller must stop;
@@ -96,6 +104,9 @@ async def acquire(update) -> "tuple[bool, str | None]":
     cmd = _cmd_name(update)
     if not cmd:
         return True, None
+    # Catch-all listeners and command handlers must not share ownership.
+    if handler:
+        cmd = f"{cmd}:{handler}"
 
     chat = getattr(update, "chat", None)
     user = getattr(update, "from_user", None)
@@ -113,7 +124,7 @@ async def acquire(update) -> "tuple[bool, str | None]":
     # real /start handler in group 0 was silently dropped as a "double tap".
     # A message may now take the lock only once: any later handler seeing the
     # very same message is simply let through without locking again.
-    msg_key = (chat_id, getattr(update, "id", 0) or 0)
+    msg_key = (chat_id, getattr(update, "id", 0) or 0, cmd)
     if msg_key[1] and msg_key in _seen_messages:
         return True, None
 
@@ -128,18 +139,24 @@ async def acquire(update) -> "tuple[bool, str | None]":
         return False, None
 
     _inflight[key] = now
+    token = next(_tokens)
+    _owners[key] = token
     if msg_key[1]:
         _seen_messages[msg_key] = now
     instant_ack(update)
-    return True, f"{chat_id}|{cmd}"
+    return True, f"{chat_id}|{cmd}|{token}"
 
 
 def release(key: "str | None", update=None) -> None:
     if not key:
         return
     try:
-        chat_str, cmd = key.split("|", 1)
-        _inflight.pop((int(chat_str), cmd), None)
+        chat_str, cmd, token = key.split("|", 2)
+        owned_key = (int(chat_str), cmd)
+        if _owners.get(owned_key) != int(token):
+            return
+        _owners.pop(owned_key, None)
+        _inflight.pop(owned_key, None)
         user = getattr(update, "from_user", None)
         _recent[(int(chat_str), getattr(user, "id", 0) or 0, cmd)] = time.monotonic()
     except Exception:  # noqa: BLE001

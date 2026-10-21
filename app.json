@@ -125,6 +125,11 @@
       "description": "fallback (default: cookies only on a retry), always, or off.",
       "value": "fallback",
       "required": false
+    },
+    "COMMAND_REACTIONS": {
+      "description": "Opt in to automatic command acknowledgement reactions",
+      "value": "false",
+      "required": false
     }
   },
   "formation": {

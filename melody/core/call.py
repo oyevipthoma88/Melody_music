@@ -244,6 +244,7 @@ _LEAVE_GRACE = 8.0
 _silence_playing: dict = {}    # chat_id → bool; True while silence stream is active
 _is_video: dict = {}           # chat_id → bool; True if current track is streaming as video
 _play_start_time: dict = {}    # chat_id → float (time.time()) when current track started/last sought
+_paused_at: dict[int, float] = {}
 _seek_offset: dict = {}        # chat_id → int seconds; playback position baked into the last stream swap
 _speed: dict = {}              # chat_id → float playback speed (1.0 = normal)
 _muted: dict = {}              # chat_id → bool; True while the stream is muted
@@ -918,7 +919,7 @@ def _is_local_media_proxy(path: str | None) -> bool:
 
 
 async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 0,
-                               force: bool = False):
+                               force: bool = False, speed: float | None = None):
     """Build a MediaStream that plays straight off the CDN — nothing downloaded.
 
     ROOT-CAUSE FIX ("/vplay me audio aur video miss match ho rahi hai" +
@@ -977,7 +978,7 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
                 if os.getenv('DISABLE_DIRECT_STREAM', '0') == '1':
                     raise ValueError('FastPlay: skip direct stream')
                 return await _build_direct_stream(
-                    chat_id, track, video, seconds, force=True,
+                    chat_id, track, video, seconds, force=True, speed=speed,
                 )
             except Exception as retry_exc:
                 LOGGER.info(
@@ -1001,7 +1002,7 @@ async def _build_direct_stream(chat_id: int, track, video: bool, seconds: int = 
     # the full -reconnect* set for http(s) inputs, so adding ours would emit
     # each flag twice on the same ffmpeg command line.
     ffmpeg_params = (
-        _ffmpeg_params(chat_id, seconds, source=audio_url, include_reconnect=False) or None
+        _ffmpeg_params(chat_id, seconds, source=audio_url, include_reconnect=False, speed=speed) or None
     )
     headers = urls.get("headers") or None
 
@@ -1087,6 +1088,7 @@ def _ffmpeg_params(
     seconds: int = 0,
     source: str | None = None,
     include_reconnect: bool = True,
+    speed: float | None = None,
 ) -> str:
     """Build the ffmpeg parameter string for a MediaStream.
 
@@ -1106,14 +1108,15 @@ def _ffmpeg_params(
         parts.append(_HTTP_RECONNECT_FFMPEG)
     if seconds > 0:
         parts.append(f"-ss {seconds}")
-    speed = get_speed(chat_id)
+    speed = get_speed(chat_id) if speed is None else speed
     if abs(speed - 1.0) > 0.001:
         parts.append(f"--audio -atmid -af atempo={speed:.3f}")
         parts.append(f"--video -itsscale {1 / speed:.6f}")
     return " ".join(parts)
 
 
-def _local_media_stream(chat_id: int, filepath: str, video: bool, seconds: int = 0):
+def _local_media_stream(chat_id: int, filepath: str, video: bool, seconds: int = 0,
+                        speed: float | None = None):
     """MediaStream for an already-downloaded local file."""
     audio_quality = _get_audio_quality()
     if video:
@@ -1121,7 +1124,7 @@ def _local_media_stream(chat_id: int, filepath: str, video: bool, seconds: int =
             filepath,
             audio_parameters=audio_quality,
             video_parameters=_get_video_quality(),
-            ffmpeg_parameters=_ffmpeg_params(chat_id, seconds, source=filepath) or None,
+            ffmpeg_parameters=_ffmpeg_params(chat_id, seconds, source=filepath, speed=speed) or None,
         )
     return MediaStream(
         filepath,
@@ -1138,7 +1141,7 @@ def _local_media_stream(chat_id: int, filepath: str, video: bool, seconds: int =
         # like "bohot jyada lag". Declaring the file audio-only removes the
         # failed probes AND the premature stream ends.
         video_flags=MediaStream.Flags.IGNORE,
-        ffmpeg_parameters=_ffmpeg_params(chat_id, seconds, source=filepath) or None,
+        ffmpeg_parameters=_ffmpeg_params(chat_id, seconds, source=filepath, speed=speed) or None,
     )
 
 
@@ -2234,6 +2237,7 @@ async def _stream_track(chat_id: int, track, video: bool = False, _retry: bool =
             _listener_mode.pop(chat_id, None)
             _is_video[chat_id] = video
             _play_start_time[chat_id] = time.time()
+            _paused_at.pop(chat_id, None)
             _seek_offset[chat_id] = max(0, int(start_at or 0))
             for k in [k for k in _premature_resumes if k.startswith(f"{chat_id}:") and not k.endswith(f":{track.video_id}")]:
                 _premature_resumes.pop(k, None)
@@ -3209,6 +3213,7 @@ def _forget_call_state(chat_id: int) -> None:
     _silence_playing.pop(chat_id, None)
     _is_video.pop(chat_id, None)
     _play_start_time.pop(chat_id, None)
+    _paused_at.pop(chat_id, None)
     _seek_offset.pop(chat_id, None)
     _prefetch_inflight.pop(chat_id, None)
     for k in [k for k in _premature_resumes if k.startswith(f"{chat_id}:")]:
@@ -3255,8 +3260,15 @@ async def pause_stream(chat_id: int) -> bool:
         _forget_call_state(chat_id)
         return False
     try:
-        await asyncio.wait_for(_pytgcalls.pause(chat_id), timeout=_CONTROL_RPC_TIMEOUT)
-        return True
+        async with _get_stream_commit_lock(chat_id):
+            if not _active.get(chat_id) or _is_leaving(chat_id):
+                return False
+            paused_at = time.time()
+            await asyncio.wait_for(_pytgcalls.pause(chat_id), timeout=_CONTROL_RPC_TIMEOUT)
+            if _active.get(chat_id) and not _is_leaving(chat_id):
+                _paused_at.setdefault(chat_id, paused_at)
+                return True
+            return False
     except Exception as exc:
         # BUG FIX: a stale call (VC ended / assistant kicked or disconnected)
         # is an expected state, not a crash — clean up and tell the caller
@@ -3283,8 +3295,16 @@ async def resume_stream(chat_id: int) -> bool:
         _forget_call_state(chat_id)
         return False
     try:
-        await asyncio.wait_for(_pytgcalls.resume(chat_id), timeout=_CONTROL_RPC_TIMEOUT)
-        return True
+        async with _get_stream_commit_lock(chat_id):
+            if not _active.get(chat_id) or _is_leaving(chat_id):
+                return False
+            await asyncio.wait_for(_pytgcalls.resume(chat_id), timeout=_CONTROL_RPC_TIMEOUT)
+            if not _active.get(chat_id) or _is_leaving(chat_id):
+                return False
+            paused_at = _paused_at.pop(chat_id, None)
+            if paused_at is not None and chat_id in _play_start_time:
+                _play_start_time[chat_id] += time.time() - paused_at
+            return True
     except Exception as exc:
         if _is_not_in_call(exc):
             LOGGER.info("resume_stream: not in call for %s — clearing state", chat_id)
@@ -3364,7 +3384,8 @@ async def stop_stream(chat_id: int):
     clear_queue(chat_id, persist=False)
     set_current(chat_id, None)
     _forget_call_state(chat_id)
-    await _hard_leave(chat_id)
+    async with _get_stream_commit_lock(chat_id):
+        await _hard_leave(chat_id)
     from utils.playback_state import mark_inactive
     await mark_inactive(chat_id, clear=True)
 
@@ -3419,7 +3440,7 @@ def get_playback_position(chat_id: int) -> int:
         return 0
     # BUG FIX: at 1.5x the track advances 1.5s per wall-clock second, so
     # /seekback and the progress readout were wrong whenever /speed was used.
-    played = (time.time() - _play_start_time[chat_id]) * get_speed(chat_id)
+    played = (_paused_at.get(chat_id, time.time()) - _play_start_time[chat_id]) * get_speed(chat_id)
     elapsed = _seek_offset.get(chat_id, 0) + int(played)
     track = get_current(chat_id)
     if track and track.duration:
@@ -3429,6 +3450,7 @@ def get_playback_position(chat_id: int) -> int:
 
 async def seek_stream(
     chat_id: int, seconds: int, *, prefer_local: bool = False,
+    target_speed: float | None = None,
 ) -> int:
     """Seek to an absolute position (in seconds) into the currently playing
     track.
@@ -3447,6 +3469,14 @@ async def seek_stream(
     track = get_current(chat_id)
     if not track or not _pytgcalls or not _active.get(chat_id):
         raise RuntimeError("Nothing is playing right now.")
+
+    generation = _stream_generation.get(chat_id, 0)
+
+    def ensure_current():
+        if (get_current(chat_id) is not track
+                or _stream_generation.get(chat_id, 0) != generation
+                or not _active.get(chat_id) or _is_leaving(chat_id)):
+            raise RuntimeError("Playback changed while seeking.")
 
     seconds = max(0, int(seconds))
     if track.duration:
@@ -3468,22 +3498,51 @@ async def seek_stream(
         local_path = await download_audio(
             track.video_id,
             audio_only=not video,
-            allow_early=False,
+            allow_early=False, owner=chat_id,
         )
 
     stream = None
     if local_path:
-        stream = _local_media_stream(chat_id, local_path, video, seconds)
+        stream = _local_media_stream(chat_id, local_path, video, seconds, speed=target_speed)
     else:
         # Normal /seek keeps the low-latency direct path.
-        stream = await _build_direct_stream(chat_id, track, video, seconds)
+        stream = await _build_direct_stream(chat_id, track, video, seconds, speed=target_speed)
         if stream is None:
-            local_path = await download_audio(track.video_id, audio_only=not video)
-            stream = _local_media_stream(chat_id, local_path, video, seconds)
+            local_path = await download_audio(
+                track.video_id, audio_only=not video, allow_early=False, owner=chat_id,
+            )
+            stream = _local_media_stream(chat_id, local_path, video, seconds, speed=target_speed)
 
-    _silence_playing.pop(chat_id, None)
+    async def commit(candidate):
+        async with _get_stream_commit_lock(chat_id):
+            ensure_current()
+            old_speed = get_speed(chat_id)
+            try:
+                ensure_current()
+                if candidate is None:
+                    raise RuntimeError("No playable seek source.")
+                await asyncio.wait_for(_pytgcalls.play(chat_id, candidate), timeout=_LOCAL_PLAY_TIMEOUT)
+                ensure_current()
+            except BaseException:
+                if (_stream_generation.get(chat_id, 0) == generation
+                        and get_current(chat_id) is track and _active.get(chat_id)):
+                    _speed[chat_id] = old_speed
+                raise
+            if target_speed is not None:
+                _speed[chat_id] = target_speed
+            _silence_playing.pop(chat_id, None)
+            _active[chat_id] = True
+            _paused_at.pop(chat_id, None)
+            _seek_offset[chat_id] = seconds
+            _play_start_time[chat_id] = time.time()
+            from utils.playback_state import save_snapshot
+            await save_snapshot(
+                chat_id, track, get_queue(chat_id), get_loop(chat_id), get_volume(chat_id),
+                active=True, position=seconds, video=video, speed=get_speed(chat_id),
+            )
+
     try:
-        await _pytgcalls.play(chat_id, stream)
+        await commit(stream)
     except Exception as play_exc:
         # Same ffprobe/dead-CDN-URL failure as in _stream_track (see
         # _is_probe_error): /seek must not die just because the resolved
@@ -3494,17 +3553,12 @@ async def seek_stream(
             "Seek: direct CDN stream unusable for %s in %s (%s) — downloading.",
             track.video_id, chat_id, type(play_exc).__name__,
         )
-        local_path = await download_audio(track.video_id, audio_only=not video)
-        stream = _local_media_stream(chat_id, local_path, video, seconds)
-        await _pytgcalls.play(chat_id, stream)
-    _active[chat_id] = True
-    _seek_offset[chat_id] = seconds
-    _play_start_time[chat_id] = time.time()
-    from utils.playback_state import save_snapshot
-    await save_snapshot(
-        chat_id, get_current(chat_id), get_queue(chat_id), get_loop(chat_id), get_volume(chat_id),
-        active=True, position=seconds, video=video, speed=get_speed(chat_id),
-    )
+        ensure_current()
+        local_path = await download_audio(
+            track.video_id, audio_only=not video, allow_early=False, owner=chat_id,
+        )
+        stream = _local_media_stream(chat_id, local_path, video, seconds, speed=target_speed)
+        await commit(stream)
     return seconds
 
 
@@ -3569,9 +3623,8 @@ async def set_playback_speed(chat_id: int, speed: float) -> bool:
         return False
 
     position = get_playback_position(chat_id)
-    _speed[chat_id] = speed
     try:
-        await seek_stream(chat_id, position)
+        await seek_stream(chat_id, position, target_speed=speed)
         return True
     except Exception as exc:
         if _is_not_in_call(exc):

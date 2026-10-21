@@ -124,6 +124,7 @@ class Config:
     # Bot settings
     # No song-duration cap: Melody plays full songs, mixes, even long live
     # sets, with no artificial cutoff anywhere in the codebase.
+    COMMAND_REACTIONS: bool = _env_bool("COMMAND_REACTIONS", False)
     AUTOPLAY: bool = _env_bool("AUTOPLAY", True)
     # Optional lean profile: load only music plugins and skip unrelated admin,
     # social and utility handlers. Full Melody remains the default.

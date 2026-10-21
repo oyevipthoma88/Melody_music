@@ -390,7 +390,9 @@ def error_handler(func):
         lock_key = None
         if isinstance(update, Message):
             try:
-                allowed, lock_key = await cmd_lock.acquire(update)
+                allowed, lock_key = await cmd_lock.acquire(
+                    update, handler=f"{func.__module__}.{func.__name__}",
+                )
                 if not allowed:
                     return
             except Exception:

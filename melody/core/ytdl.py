@@ -487,10 +487,10 @@ def _meta_cache_put(key: str, info: dict) -> None:
 _download_futures: dict = {}
 _download_jobs: set[asyncio.Task] = set()
 _download_futures_lock = asyncio.Lock()
-# dedup_key -> (cooperative cancel event, owner token, priority). A newer
+# dedup_key -> (cooperative cancel event, owner token set, priority). A newer
 # request may stop only low-priority work; a different chat sharing the same
 # video is never canceled when its key is explicitly excluded.
-_download_cancel_events: dict[str, tuple[threading.Event, object | None, int]] = {}
+_download_cancel_events: dict[str, tuple[threading.Event, set, int]] = {}
 
 
 def cancel_download(video_id: str, audio_only: bool = True, owner=None) -> bool:
@@ -504,9 +504,13 @@ def cancel_download(video_id: str, audio_only: bool = True, owner=None) -> bool:
     entry = _download_cancel_events.get(key)
     if entry is None:
         return False
-    event, current_owner, _priority = entry
-    if owner is not None and current_owner is not None and current_owner != owner:
-        return False
+    event, consumers, _priority = entry
+    if owner is not None:
+        if owner not in consumers:
+            return False
+        consumers.discard(owner)
+        if consumers:
+            return False
     event.set()
     return True
 
@@ -575,8 +579,10 @@ class _PriorityDownloadGate:
         self.sequence = 0
         self.waiters: list[tuple[int, int, asyncio.Future]] = []
         self.lock = asyncio.Lock()
+        self.keys: dict[asyncio.Future, str] = {}
+        self.granted: set[asyncio.Future] = set()
 
-    async def acquire(self, priority: int = 0) -> None:
+    async def acquire(self, priority: int = 0, *, key: str | None = None) -> None:
         async with self.lock:
             if self.running < self.capacity and not self.waiters:
                 self.running += 1
@@ -585,6 +591,8 @@ class _PriorityDownloadGate:
             future = loop.create_future()
             self.sequence += 1
             heapq.heappush(self.waiters, (int(priority), self.sequence, future))
+            if key is not None:
+                self.keys[future] = key
         try:
             await future
         except asyncio.CancelledError:
@@ -594,7 +602,27 @@ class _PriorityDownloadGate:
                         self.waiters.pop(index)
                         heapq.heapify(self.waiters)
                         break
+                if future in self.granted:
+                    # Reclaim only a slot actually granted to this waiter.
+                    self.running = max(0, self.running - 1)
+                    while self.waiters:
+                        _, _, next_future = heapq.heappop(self.waiters)
+                        if not next_future.cancelled():
+                            self.running += 1
+                            self.granted.add(next_future)
+                            next_future.set_result(None)
+                            break
             raise
+        finally:
+            self.keys.pop(future, None)
+            self.granted.discard(future)
+
+    def promote(self, key: str, priority: int) -> None:
+        self.waiters = [
+            (min(p, int(priority)) if self.keys.get(f) == key else p, seq, f)
+            for p, seq, f in self.waiters
+        ]
+        heapq.heapify(self.waiters)
 
     async def release(self) -> None:
         async with self.lock:
@@ -604,6 +632,7 @@ class _PriorityDownloadGate:
                 if future.cancelled():
                     continue
                 self.running += 1
+                self.granted.add(future)
                 future.set_result(None)
                 break
 
@@ -4459,8 +4488,17 @@ async def download_audio(
             if state is not None:
                 _download_early_states[dedup_key] = state
             existing = None
+            cancel_event = threading.Event()
+            _download_cancel_events[dedup_key] = (cancel_event, {owner}, int(priority))
         else:
             fut = existing
+            entry = _download_cancel_events.get(dedup_key)
+            if entry is not None:
+                event, consumers, previous_priority = entry
+                consumers.add(owner)
+                promoted_priority = min(previous_priority, int(priority))
+                _download_cancel_events[dedup_key] = (event, consumers, promoted_priority)
+                _download_semaphore().promote(dedup_key, promoted_priority)
     if existing is not None:
         LOGGER.debug("⚡ download_audio dedup: reusing in-flight download for %s", dedup_key)
         if allow_early and state is not None:
@@ -4479,8 +4517,6 @@ async def download_audio(
                         task.cancel()
         return await asyncio.shield(fut)
 
-    cancel_event = threading.Event()
-    _download_cancel_events[dedup_key] = (cancel_event, owner, int(priority))
     job = asyncio.create_task(
         _run_download_job(
             video_id, audio_only, tag, priority, _download_requested_at,
@@ -4646,7 +4682,11 @@ async def _download_audio_impl(
     """
     gate = _download_semaphore()
     request_started_at = requested_at if requested_at is not None else _time_mod.monotonic()
-    await gate.acquire(priority)
+    dedup_key = f"{video_id}:{tag}"
+    entry = _download_cancel_events.get(dedup_key)
+    if entry is not None:
+        priority = min(priority, entry[2])
+    await gate.acquire(priority, key=dedup_key)
     slot_started_at = _time_mod.monotonic()
     LOGGER.info(
         "#download start %s variant=%s priority=%d slot_wait=%.2fs",

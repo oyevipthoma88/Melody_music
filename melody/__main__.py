@@ -376,6 +376,7 @@ async def register_slash_commands(bot):
             if command.command in {"cplay", "cvplay", "cpause", "cresume", "cskip", "cstop", "cend"}
         ]
         private_commands = []
+        owner_commands = []
 
     async def _set_commands_safely(commands, scope, label):
         """Register a menu and recover from Telegram's per-scope limit."""

@@ -20,7 +20,6 @@ No external API needed — fully offline, zero latency.
 """
 import random
 import re
-import time
 import asyncio
 
 from pyrogram import Client, enums, filters
@@ -39,11 +38,6 @@ FLAG = "chatbot_enabled"
 # Tracks the last N responses per chat so we never repeat the same line.
 _last_responses: dict[int, list[str]] = {}
 _MEMORY_SIZE = 8
-
-# ─── Sticker pack (popular public sticker file_ids are ephemeral, so we use
-# emoji-based sticker sending via the bot's own uploaded stickers. If no
-# sticker is available, we just skip it.)
-_STICKER_CHANCE = 0.12  # 12% chance to send a sticker instead of text
 
 # ─── Typing simulation ───────────────────────────────────────────────────────
 # Telegram typing indicator lasts ~5 seconds. We simulate human typing speed
@@ -465,14 +459,11 @@ async def chatbot_handler(client: Client, message: Message):
 
     # Determine if we should respond
     should_respond = False
-    is_direct = False
 
     if _is_reply_to_bot(message, bot_id):
         should_respond = True
-        is_direct = True
     elif _is_bot_mentioned(message):
         should_respond = True
-        is_direct = True
     else:
         # Random chance for standalone messages
         should_respond = _should_respond_randomly()
@@ -500,17 +491,6 @@ async def chatbot_handler(client: Client, message: Message):
         pass
 
     await asyncio.sleep(typing_delay)
-
-    # Occasionally send a sticker before the text (feels more human)
-    if not is_direct and random.random() < _STICKER_CHANCE:
-        try:
-            # Try sending a reaction emoji sticker
-            sticker_emojis = ["👍", "😂", "❤️", "🔥", "👏", "🎉"]
-            emoji = random.choice(sticker_emojis)
-            await message.reply_sticker(sticker_emoji=emoji)
-            return
-        except Exception:
-            pass  # Fall through to text response if sticker fails
 
     # Send the response
     try:
